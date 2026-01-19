@@ -295,7 +295,8 @@ ivshmem_server_start(IvshmemServer *server)
     if (server->use_shm_open) {
         IVSHMEM_SERVER_DEBUG(server, "Using POSIX shared memory: %s\n",
                              server->shm_path);
-        shm_fd = shm_open(server->shm_path, O_CREAT | O_RDWR, S_IRWXU);
+        //shm_fd = shm_open(server->shm_path, O_CREAT | O_RDWR, S_IRWXU);
+        shm_fd = -1;
     } else {
         gchar *filename = g_strdup_printf("%s/ivshmem.XXXXXX", server->shm_path);
         IVSHMEM_SERVER_DEBUG(server, "Using file-backed shared memory: %s\n",
@@ -354,7 +355,7 @@ err_close_sock:
     close(sock_fd);
 err_close_shm:
     if (server->use_shm_open) {
-        shm_unlink(server->shm_path);
+        //shm_unlink(server->shm_path);
     }
     close(shm_fd);
     return -1;
@@ -374,7 +375,7 @@ ivshmem_server_close(IvshmemServer *server)
 
     unlink(server->unix_sock_path);
     if (server->use_shm_open) {
-        shm_unlink(server->shm_path);
+        //shm_unlink(server->shm_path);
     }
     close(server->sock_fd);
     close(server->shm_fd);
