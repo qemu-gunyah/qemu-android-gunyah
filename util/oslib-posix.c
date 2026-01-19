@@ -975,7 +975,8 @@ int qemu_shm_alloc(size_t size, Error **errp)
     g_string_printf(shm_name, "/qemu-" FMT_pid "-shm-%d", getpid(),
                     cur_sequence);
 
-    fd = shm_open(shm_name->str, oflag, mode);
+    //fd = shm_open(shm_name->str, oflag, mode);
+    fd = -1;
     if (fd < 0) {
         error_setg_errno(errp, errno,
                          "failed to create POSIX shared memory");
@@ -987,7 +988,7 @@ int qemu_shm_alloc(size_t size, Error **errp)
      * POSIX shared memory object. However it will remain allocated as long as
      * there are file descriptors pointing to it.
      */
-    shm_unlink(shm_name->str);
+    //shm_unlink(shm_name->str);
 
     if (ftruncate(fd, size) == -1) {
         error_setg_errno(errp, errno,
