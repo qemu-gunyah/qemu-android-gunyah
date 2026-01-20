@@ -369,12 +369,7 @@ qemu_common_flags = [
   '-fno-strict-aliasing', '-fno-common', '-fwrapv' ]
 qemu_cflags = []
 qemu_ldflags = []
-
-# Android logging APIs (android/log.h) live in liblog.
-# When building for Android, ensure we always link -llog so __android_log_print/__android_log_write resolve.
-if host_os == 'android'
-  qemu_ldflags += ['-llog']
-endif
+qemu_ldflags += ['-llog']
 
 if host_os == 'darwin'
   # Disable attempts to use ObjectiveC features in os/object.h since they
