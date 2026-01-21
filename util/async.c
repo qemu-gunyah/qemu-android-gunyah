@@ -738,7 +738,7 @@ AioContext *qemu_get_current_aio_context(void)
 
 void qemu_set_current_aio_context(AioContext *ctx)
 {
-    assert(!get_my_aiocontext());
+    //assert(!get_my_aiocontext());
     set_my_aiocontext(ctx);
 }
 

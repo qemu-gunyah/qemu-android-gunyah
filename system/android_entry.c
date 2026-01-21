@@ -5,6 +5,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #include <android/log.h>
 
@@ -81,6 +83,10 @@ int android_qemu_start(int argc, char **argv) {
     }
 
     LOGI("Starting QEMU...");
+    LOGI("android_qemu_start argv dump:");
+    for (int i = 0; i < argc; i++) {
+        LOGI("  argv[%d] = '%s'", i, argv[i] ? argv[i] : "(null)");
+    }
 
     qemu_init(argc, argv);
     bql_unlock();
@@ -100,42 +106,75 @@ int android_qemu_start(int argc, char **argv) {
     }
 }
 
-typedef struct {
-    int argc;
-    char **argv;
-} QemuArgs;
-
-static void *qemu_thread_fn(void *arg) {
-    QemuArgs *qa = (QemuArgs *)arg;
-    android_qemu_start(qa->argc, qa->argv);
-
-    for (int i = 0; i < qa->argc; i++) free(qa->argv[i]);
-    free(qa->argv);
-    free(qa);
-    return NULL;
-}
+static pid_t g_qemu_pid = -1;
 
 JNIEXPORT void JNICALL
 Java_com_vectras_qemu_jni_Loader_startQemu(JNIEnv *env, jclass clazz, jobjectArray jargs) {
     (void)clazz;
 
     int argc = (*env)->GetArrayLength(env, jargs);
-    LOGI("Jni Starting QEMU...");
+    LOGI("Jni Starting QEMU... argc=%d", argc);
 
-    QemuArgs *qa = (QemuArgs *)malloc(sizeof(QemuArgs));
-    qa->argc = argc;
-    qa->argv = (char **)malloc(sizeof(char*) * (argc + 1));
+    // Build argv (NULL-terminated)
+    char **argv = (char **)malloc(sizeof(char*) * (argc + 1));
+    if (!argv) {
+        LOGE("malloc argv failed");
+        return;
+    }
 
     for (int i = 0; i < argc; i++) {
         jstring js = (jstring)(*env)->GetObjectArrayElement(env, jargs, i);
         const char *str = (*env)->GetStringUTFChars(env, js, 0);
-        qa->argv[i] = strdup(str);
+        argv[i] = strdup(str);
         (*env)->ReleaseStringUTFChars(env, js, str);
         (*env)->DeleteLocalRef(env, js);
-    }
-    qa->argv[argc] = NULL;
 
-    pthread_t thread;
-    pthread_create(&thread, NULL, qemu_thread_fn, qa);
-    pthread_detach(thread);
+        if (!argv[i]) {
+            LOGE("strdup failed at arg %d", i);
+            // cleanup what we already allocated
+            for (int j = 0; j < i; j++) {
+                free(argv[j]);
+            }
+            free(argv);
+            return;
+        }
+    }
+    argv[argc] = NULL;
+    LOGI("JNI argv dump:");
+    for (int i = 0; i < argc; i++) {
+        LOGI("  argv[%d] = '%s'", i, argv[i] ? argv[i] : "(null)");
+    }
+
+    // Fork and run QEMU in the child process
+    pid_t pid = fork();
+    if (pid < 0) {
+        LOGE("fork failed");
+        for (int i = 0; i < argc; i++) {
+            free(argv[i]);
+        }
+        free(argv);
+        return;
+    }
+
+    if (pid == 0) {
+        // Child: run QEMU (this will typically block for the VM lifetime)
+        LOGI("QEMU child process started");
+        int ret = android_qemu_start(argc, argv);
+
+        for (int i = 0; i < argc; i++) {
+            free(argv[i]);
+        }
+        free(argv);
+
+        _exit(ret);
+    }
+
+    // Parent: free argv and return to Java immediately
+    g_qemu_pid = pid;
+    LOGI("QEMU forked pid=%d", (int)pid);
+
+    for (int i = 0; i < argc; i++) {
+        free(argv[i]);
+    }
+    free(argv);
 }
