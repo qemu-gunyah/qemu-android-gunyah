@@ -363,35 +363,37 @@ void qemu_coroutine_dec_pool_size(unsigned int removing_pool_size)
 
 static unsigned int get_global_pool_hard_max_size(void)
 {
-#ifdef __linux__
-    g_autofree char *contents = NULL;
-    int max_map_count;
+// #ifdef __linux__
+//     g_autofree char *contents = NULL;
+//     int max_map_count;
 
-    /*
-     * Linux processes can have up to max_map_count virtual memory areas
-     * (VMAs). mmap(2), mprotect(2), etc fail with ENOMEM beyond this limit. We
-     * must limit the coroutine pool to a safe size to avoid running out of
-     * VMAs.
-     */
-    if (g_file_get_contents("/proc/sys/vm/max_map_count", &contents, NULL,
-                            NULL) &&
-        qemu_strtoi(contents, NULL, 10, &max_map_count) == 0) {
-        /*
-         * This is an upper bound that avoids exceeding max_map_count. Leave a
-         * fixed amount for non-coroutine users like library dependencies,
-         * vhost-user, etc. Each coroutine takes up 2 VMAs so halve the
-         * remaining amount.
-         */
-        if (max_map_count > 5000) {
-            return (max_map_count - 5000) / 2;
-        } else {
-            /* Disable the global pool but threads still have local pools */
-            return 0;
-        }
-    }
-#endif
+//     /*
+//      * Linux processes can have up to max_map_count virtual memory areas
+//      * (VMAs). mmap(2), mprotect(2), etc fail with ENOMEM beyond this limit. We
+//      * must limit the coroutine pool to a safe size to avoid running out of
+//      * VMAs.
+//      */
+//     if (g_file_get_contents("/proc/sys/vm/max_map_count", &contents, NULL,
+//                             NULL) &&
+//         qemu_strtoi(contents, NULL, 10, &max_map_count) == 0) {
+//         /*
+//          * This is an upper bound that avoids exceeding max_map_count. Leave a
+//          * fixed amount for non-coroutine users like library dependencies,
+//          * vhost-user, etc. Each coroutine takes up 2 VMAs so halve the
+//          * remaining amount.
+//          */
+//         if (max_map_count > 5000) {
+//             return (max_map_count - 5000) / 2;
+//         } else {
+//             /* Disable the global pool but threads still have local pools */
+//             return 0;
+//         }
+//     }
+// #endif
 
-    return UINT_MAX;
+//     return UINT_MAX;
+
+return 30265;
 }
 
 static void __attribute__((constructor)) qemu_coroutine_init(void)

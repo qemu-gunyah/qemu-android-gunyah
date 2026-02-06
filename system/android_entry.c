@@ -9,6 +9,8 @@
 #include <errno.h>
 #include <android/log.h>
 #include <stdbool.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include "qemu/osdep.h"
 #include "qemu-main.h"
@@ -55,6 +57,17 @@ typedef struct {
 } LogThreadArgs;
 
 static void *log_reader_thread_fn(void *arg) {
+    pid_t tid = (pid_t)syscall(SYS_gettid);
+    pthread_t self = pthread_self();
+
+    __android_log_print(
+        ANDROID_LOG_WARN,
+        "QEMU-PTHREAD",
+        "log_reader_thread start: tid=%d pthread=%p",
+        tid,
+        (void *)self
+    );
+
     LogThreadArgs *a = (LogThreadArgs *)arg;
     int fd = a->fd;
     int level = a->level;
@@ -65,15 +78,24 @@ static void *log_reader_thread_fn(void *arg) {
         ssize_t n = read(fd, buf, sizeof(buf) - 1);
         if (n <= 0) break;
         buf[n] = 0;
+
         int outfd = get_forward_fd();
         if (outfd >= 0) {
             const char *prefix = (level == QEMU_LOG_STDERR) ? "[E] " : "[O] ";
-            (void)write(outfd, prefix, (size_t)strlen(prefix));
-            (void)write(outfd, buf, (size_t)strlen(buf));
+            write(outfd, prefix, strlen(prefix));
+            write(outfd, buf, strlen(buf));
         } else {
             __android_log_print(level, kLogTag, "%s", buf);
         }
     }
+
+    __android_log_print(
+        ANDROID_LOG_WARN,
+        "QEMU-PTHREAD",
+        "log_reader_thread exit: tid=%d",
+        tid
+    );
+
     close(fd);
     return NULL;
 }
@@ -110,26 +132,30 @@ static void setup_stdio_pipes(void) {
 __attribute__((visibility("default")))
 int android_qemu_start(int argc, char **argv) {
     setup_stdio_pipes();
-
-    /* QEMU upstream main.c (Android-friendly path): */
-    qemu_init(argc, argv);
-    bql_unlock();
-    replay_mutex_unlock();
-
     /*
      * IMPORTANT: Run the QEMU main loop on THIS thread.
      * Do not spawn another thread here, otherwise qemu_in_main_thread()
      * assertions can trip in subsystems that must execute on the main thread.
      */
+
+    /* QEMU upstream main.c (Android-friendly path): */
+
+    qemu_init(argc, argv);
+    /* Debug: print AioContext binding */
+    // AioContext *main_aio = qemu_get_aio_context();
+    // AioContext *current_aio = qemu_get_current_aio_context();
+    // __android_log_print(ANDROID_LOG_INFO, "QEMU-AIO",
+    //                     "After qemu_init: main_aio=%p current_aio=%p",
+    //                     main_aio, current_aio);    
+    bql_unlock();
+    replay_mutex_unlock();
     int status;
+    // qemu_main_loop() only returns on exit
     replay_mutex_lock();
     bql_lock();
     status = qemu_main_loop();
-    qemu_cleanup(status);
-    bql_unlock();
-    replay_mutex_unlock();
 
-    // qemu_main_loop() only returns on exit
+    qemu_cleanup(status);
     return status;
 }
 

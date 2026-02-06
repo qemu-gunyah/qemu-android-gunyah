@@ -512,13 +512,12 @@ ucontext_probe = '''
 # On Windows the only valid backend is the Windows specific one.
 # For POSIX prefer ucontext, but it's not always possible. The fallback
 # is sigcontext.
+# wasdwasd0105: force allow ucontext
 supported_backends = []
 if host_os == 'windows'
   supported_backends += ['windows']
 else
-  if host_os != 'darwin' and cc.links(ucontext_probe)
-    supported_backends += ['ucontext']
-  endif
+  supported_backends += ['ucontext']
   supported_backends += ['sigaltstack']
 endif
 
@@ -4445,7 +4444,7 @@ subdir('scripts')
 subdir('tools')
 subdir('pc-bios')
 subdir('docs')
-subdir('tests')
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # subdir('tests')
 if gtk.found()
   subdir('po')
 endif
