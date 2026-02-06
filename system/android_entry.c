@@ -138,23 +138,15 @@ int android_qemu_start(int argc, char **argv) {
      * assertions can trip in subsystems that must execute on the main thread.
      */
 
-    /* QEMU upstream main.c (Android-friendly path): */
-
-    qemu_init(argc, argv);
-    /* Debug: print AioContext binding */
-    // AioContext *main_aio = qemu_get_aio_context();
-    // AioContext *current_aio = qemu_get_current_aio_context();
-    // __android_log_print(ANDROID_LOG_INFO, "QEMU-AIO",
-    //                     "After qemu_init: main_aio=%p current_aio=%p",
-    //                     main_aio, current_aio);    
+    qemu_init(argc, argv); 
     bql_unlock();
     replay_mutex_unlock();
     int status;
-    // qemu_main_loop() only returns on exit
     replay_mutex_lock();
     bql_lock();
-    status = qemu_main_loop();
 
+    // qemu_main_loop() only returns on exit
+    status = qemu_main_loop();
     qemu_cleanup(status);
     return status;
 }
