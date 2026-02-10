@@ -7,7 +7,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <android/log.h>
 #include <stdbool.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -18,6 +17,9 @@
 #include "system/replay.h"
 #include "system/system.h"
 
+#include <sys/ucontext.h>
+#include <stddef.h>
+
 static JavaVM *g_vm = NULL;
 static jobject g_log_callback = NULL; // GlobalRef
 
@@ -26,7 +28,9 @@ enum {
     QEMU_LOG_STDERR = 2,
 };
 
+#include <android/log.h>
 static const char *kLogTag = "QEMU-OUT";
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, kLogTag, __VA_ARGS__)
 
 static int g_forward_fd = -1;
 static pthread_mutex_t g_forward_fd_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -131,12 +135,30 @@ static void setup_stdio_pipes(void) {
 
 __attribute__((visibility("default")))
 int android_qemu_start(int argc, char **argv) {
+
+    __android_log_print( ANDROID_LOG_WARN, "QEMU-system", "PAGE_SIZE=%ld\n", sysconf(_SC_PAGESIZE));
+
+    qemu_thread_init_tls();
+
     setup_stdio_pipes();
     /*
      * IMPORTANT: Run the QEMU main loop on THIS thread.
      * Do not spawn another thread here, otherwise qemu_in_main_thread()
      * assertions can trip in subsystems that must execute on the main thread.
      */
+
+
+    // LOGI("DIAG: sizeof(ucontext_t)=%zu\n", sizeof(ucontext_t));
+    // LOGI("DIAG: uc_mcontext offset=%zu\n", offsetof(ucontext_t, uc_mcontext));
+    // LOGI("DIAG: regs[0] offset=%zu\n", offsetof(ucontext_t, uc_mcontext.regs[0]));
+    // LOGI("DIAG: sp offset=%zu\n", offsetof(ucontext_t, uc_mcontext.sp));
+    // LOGI("DIAG: pc offset=%zu\n", offsetof(ucontext_t, uc_mcontext.pc));
+    // LOGI("DIAG: pstate offset=%zu\n", offsetof(ucontext_t, uc_mcontext.pstate));
+    // LOGI("DIAG: uc_stack offset=%zu\n", offsetof(ucontext_t, uc_stack));
+    // LOGI("DIAG: uc_stack.ss_sp offset=%zu\n", offsetof(ucontext_t, uc_stack.ss_sp));
+    // LOGI("DIAG: uc_stack.ss_size offset=%zu\n", offsetof(ucontext_t, uc_stack.ss_size));
+    // LOGI("DIAG: uc_link offset=%zu\n", offsetof(ucontext_t, uc_link));
+    // LOGI("DIAG: uc_sigmask offset=%zu\n", offsetof(ucontext_t, uc_sigmask));
 
     qemu_init(argc, argv); 
     bql_unlock();

@@ -224,6 +224,9 @@ void qemu_thread_atexit_add(struct Notifier *notifier);
  */
 void qemu_thread_atexit_remove(struct Notifier *notifier);
 
+void qemu_thread_init_tls(void);
+
+
 #ifdef CONFIG_TSAN
 #include <sanitizer/tsan_interface.h>
 #endif

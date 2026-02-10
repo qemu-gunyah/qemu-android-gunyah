@@ -18,11 +18,19 @@
 #include "qemu/tsan.h"
 #include "qemu/bitmap.h"
 
+
+// #include <android/log.h>
+// #define LOG_TAG "QEMU_Pthread"
+// #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+
 #ifdef CONFIG_PTHREAD_SET_NAME_NP
 #include <pthread_np.h>
 #endif
 
 static bool name_threads;
+
+// __thread NotifierList thread_exit = { .notifiers = { .lh_first = NULL } };
+__thread NotifierList thread_exit;
 
 void qemu_thread_naming(bool enable)
 {
@@ -62,6 +70,17 @@ static void compute_abs_deadline(struct timespec *ts, int ms)
         ts->tv_sec++;
         ts->tv_nsec -= 1000000000;
     }
+}
+
+/* Add this function in qemu-thread-posix.c */
+void qemu_thread_init_tls(void)
+{
+    /* Android Samsung linker bug: __thread variables in dlopen'd .so
+     * may not be properly initialized from the TLS image.
+     * Force-zero all __thread NotifierLists and other critical TLS. */
+    memset(&thread_exit, 0, sizeof(thread_exit));
+    //LOGI("NLI thread_exit: listaaa=%p\n", &thread_exit);
+
 }
 
 void qemu_mutex_init(QemuMutex *mutex)
@@ -465,7 +484,6 @@ void qemu_event_wait(QemuEvent *ev)
     }
 }
 
-static __thread NotifierList thread_exit;
 
 /*
  * Note that in this implementation you can register a thread-exit
@@ -476,6 +494,8 @@ static __thread NotifierList thread_exit;
  */
 void qemu_thread_atexit_add(Notifier *notifier)
 {
+    //LOGI("NLI thread_exit: listaaa=%p\n", &thread_exit);
+
     notifier_list_add(&thread_exit, notifier);
 }
 
@@ -505,6 +525,8 @@ static void *qemu_thread_start(void *args)
     void *(*start_routine)(void *) = qemu_thread_args->start_routine;
     void *arg = qemu_thread_args->arg;
     void *r;
+
+    qemu_thread_init_tls();
 
     /* Attempt to set the threads name; note that this is for debug, so
      * we're not going to fail if we can't set it.
