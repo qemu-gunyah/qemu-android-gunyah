@@ -9,6 +9,21 @@
 #include "qemu/host-utils.h"
 #include "qemu/sockets.h"
 
+/* ANDROID_SHM_STUBS_IVSHMEM */
+#ifdef __ANDROID__
+#include <errno.h>
+static inline int android_ivshmem_shm_open(const char *name, int oflag, mode_t mode) {
+    errno = ENOSYS;
+    return -1;
+}
+static inline int android_ivshmem_shm_unlink(const char *name) {
+    errno = ENOSYS;
+    return -1;
+}
+#define shm_open android_ivshmem_shm_open
+#define shm_unlink android_ivshmem_shm_unlink
+#endif
+
 #include <sys/socket.h>
 #include <sys/un.h>
 

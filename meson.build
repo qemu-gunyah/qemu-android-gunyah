@@ -4444,7 +4444,8 @@ subdir('scripts')
 subdir('tools')
 subdir('pc-bios')
 subdir('docs')
-# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # subdir('tests')
+# vectras android: disable test
+#subdir('tests')
 if gtk.found()
   subdir('po')
 endif

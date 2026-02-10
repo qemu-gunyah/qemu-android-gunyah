@@ -949,53 +949,21 @@ void qemu_close_all_open_fd(const int *skip, unsigned int nskip)
 
 int qemu_shm_alloc(size_t size, Error **errp)
 {
-    g_autoptr(GString) shm_name = g_string_new(NULL);
-    int fd, oflag, cur_sequence;
-    static int sequence;
-    mode_t mode;
-
-    cur_sequence = qatomic_fetch_inc(&sequence);
-
-    /*
-     * Let's use `mode = 0` because we don't want other processes to open our
-     * memory unless we share the file descriptor with them.
-     */
-    mode = 0;
-    oflag = O_RDWR | O_CREAT | O_EXCL;
-
-    /*
-     * Some operating systems allow creating anonymous POSIX shared memory
-     * objects (e.g. FreeBSD provides the SHM_ANON constant), but this is not
-     * defined by POSIX, so let's create a unique name.
-     *
-     * From Linux's shm_open(3) man-page:
-     *   For  portable  use,  a shared  memory  object should be identified
-     *   by a name of the form /somename;"
-     */
-    g_string_printf(shm_name, "/qemu-" FMT_pid "-shm-%d", getpid(),
-                    cur_sequence);
-
-    //fd = shm_open(shm_name->str, oflag, mode);
-    fd = -1;
-    if (fd < 0) {
-        error_setg_errno(errp, errno,
-                         "failed to create POSIX shared memory");
-        return -1;
+/* ANDROID_DISABLE_POSIX_SHM */
+#ifdef __ANDROID__
+    /* Android NDK does not expose shm_open/shm_unlink. We do not need SHM here. */
+    if (errp) {
+        error_setg_errno(errp, ENOSYS,
+                         "POSIX shared memory is not supported on Android in this build");
     }
-
-    /*
-     * We have the file descriptor, so we no longer need to expose the
-     * POSIX shared memory object. However it will remain allocated as long as
-     * there are file descriptors pointing to it.
-     */
-    //shm_unlink(shm_name->str);
-
-    if (ftruncate(fd, size) == -1) {
-        error_setg_errno(errp, errno,
-                         "failed to resize POSIX shared memory to %zu", size);
-        close(fd);
-        return -1;
+    return -1;
+#else
+    /* This Android build script removed the non-Android implementation to avoid
+     * NDK header incompatibilities. If you hit this branch, rebuild without __ANDROID__. */
+    if (errp) {
+        error_setg_errno(errp, ENOSYS, "qemu_shm_alloc stub reached");
     }
-
-    return fd;
+    return -1;
+#endif
 }
+
