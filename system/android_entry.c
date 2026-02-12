@@ -16,6 +16,7 @@
 #include "qemu/main-loop.h"
 #include "system/replay.h"
 #include "system/system.h"
+#include "system/runstate.h"
 
 #include <sys/ucontext.h>
 #include <stddef.h>
@@ -244,4 +245,58 @@ JNIEXPORT void JNICALL JNI_OnUnload(JavaVM *vm, void *reserved) {
     (void)vm;
     (void)reserved;
     set_forward_fd(-1);
+}
+
+
+/*
+ * Clean shutdown — asks the guest to power off gracefully.
+ * Equivalent to pressing the power button / ACPI shutdown.
+ * qemu_main_loop() will return once the guest has shut down.
+ */
+JNIEXPORT void JNICALL
+Java_com_vectras_qemu_jni_Loader_shutdownQemu(JNIEnv *env, jclass clazz) {
+    (void)env;
+    (void)clazz;
+    __android_log_print(ANDROID_LOG_INFO, "QEMU-system",
+                        "stopQemu requested — scheduling shutdown");
+    /*
+     * qemu_system_shutdown_request() is safe to call from any thread.
+     * It posts an event to the main loop which will cause
+     * qemu_main_loop() to return cleanly, running qemu_cleanup().
+     */
+    qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+}
+
+/*
+ * Reboot — asks QEMU to reset the virtual machine.
+ * The guest OS will restart as if the reset button was pressed.
+ * QEMU itself keeps running; qemu_main_loop() does NOT return.
+ */
+JNIEXPORT void JNICALL
+Java_com_vectras_qemu_jni_Loader_rebootQemu(JNIEnv *env, jclass clazz) {
+    (void)env;
+    (void)clazz;
+    __android_log_print(ANDROID_LOG_INFO, "QEMU-system",
+                        "rebootQemu: requesting VM reset");
+    qemu_system_reset_request(SHUTDOWN_CAUSE_HOST_UI);
+}
+
+/*
+ * Force stop — immediately kills the QEMU process.
+ * Use only as a last resort when clean shutdown hangs.
+ * This is equivalent to pulling the power cord.
+ */
+JNIEXPORT void JNICALL
+Java_com_vectras_qemu_jni_Loader_forceStopQemu(JNIEnv *env, jclass clazz) {
+    (void)env;
+    (void)clazz;
+    __android_log_print(ANDROID_LOG_WARN, "QEMU-system",
+                        "forceStopQemu: killing process NOW");
+    /*
+     * _exit() terminates the process immediately without running
+     * atexit handlers or flushing stdio. Since android:process=":qemu"
+     * runs QEMU in a separate process, this only kills the QEMU process,
+     * not the main app process.
+     */
+    _exit(0);
 }
