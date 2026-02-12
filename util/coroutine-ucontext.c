@@ -23,7 +23,15 @@
 #define _FORTIFY_SOURCE 0
 
 #include "qemu/osdep.h"
-#include <ucontext.h>
+//#include <ucontext.h>
+
+#include <libucontext/libucontext.h>
+#define ucontext_t libucontext_ucontext_t
+#define getcontext libucontext_getcontext
+#define setcontext libucontext_setcontext
+#define swapcontext libucontext_swapcontext
+#define makecontext libucontext_makecontext
+
 #include "qemu/coroutine_int.h"
 #include "qemu/coroutine-tls.h"
 
@@ -51,7 +59,20 @@ typedef struct {
     void *unsafe_stack;
     size_t unsafe_stack_size;
 #endif
-    sigjmp_buf env;
+    /*
+     * On Android bionic, sigsetjmp/siglongjmp mangle saved SP/PC
+     * with a per-thread cookie (pointer guard). When coroutines
+     * sigsetjmp on one stack and siglongjmp from another, the
+     * demangling produces garbage → SIGILL.
+     *
+     * Use libucontext contexts instead — they don't mangle pointers
+     * and libucontext already skips signal mask save/restore by default,
+     * so there's no performance penalty vs sigsetjmp(buf,0).
+     */
+    libucontext_ucontext_t env;
+
+    /* Return value for qemu_coroutine_switch after swapcontext */
+    CoroutineAction action_on_entry;
 
 #ifdef CONFIG_TSAN
     void *tsan_co_fiber;
@@ -159,16 +180,29 @@ static void coroutine_trampoline(int i0, int i1)
     self = arg.p;
     co = &self->base;
 
-    /* Initialize longjmp environment and switch back the caller */
-    if (!sigsetjmp(self->env, 0)) {
+    /*
+     * We've just been entered via makecontext → swapcontext from
+     * qemu_coroutine_new(). Save our context and switch back to the
+     * caller so qemu_coroutine_new() can return.
+     *
+     * When we're re-entered later (via qemu_coroutine_switch calling
+     * swapcontext into self->env), we'll resume right after this
+     * swapcontext call and fall through to the while loop.
+     */
+    {
         CoroutineUContext *leaderp = get_ptr_leader();
+        libucontext_ucontext_t *caller_env =
+            (libucontext_ucontext_t *)co->entry_arg;
 
         start_switch_fiber_asan(&fake_stack_save,
                                 leaderp->stack, leaderp->stack_size);
-        start_switch_fiber_tsan(&fake_stack_save, self, true); /* true=caller */
-        siglongjmp(*(sigjmp_buf *)co->entry_arg, 1);
+        start_switch_fiber_tsan(&fake_stack_save, self, true);
+
+        /* Save self->env and return to qemu_coroutine_new */
+        libucontext_swapcontext(&self->env, caller_env);
     }
 
+    /* We resume here on every re-entry from qemu_coroutine_switch */
     finish_switch_fiber(fake_stack_save);
 
     while (true) {
@@ -181,16 +215,15 @@ Coroutine *qemu_coroutine_new(void)
 {
     CoroutineUContext *co;
     ucontext_t old_uc, uc;
-    sigjmp_buf old_env;
+    libucontext_ucontext_t caller_ctx;
     union cc_arg arg = {0};
     void *fake_stack_save = NULL;
 
-    /* The ucontext functions preserve signal masks which incurs a
-     * system call overhead.  sigsetjmp(buf, 0)/siglongjmp() does not
-     * preserve signal masks but only works on the current stack.
-     * Since we need a way to create and switch to a new stack, use
-     * the ucontext functions for that but sigsetjmp()/siglongjmp() for
-     * everything else.
+    /* On Android bionic, sigsetjmp/siglongjmp mangle saved pointers
+     * (SP, PC) with a per-thread cookie, which breaks when switching
+     * between coroutine stacks. Use libucontext for everything instead.
+     * libucontext skips signal mask save/restore by default, so there's
+     * no performance penalty.
      */
 
     if (getcontext(&uc) == -1) {
@@ -204,7 +237,7 @@ Coroutine *qemu_coroutine_new(void)
     co->unsafe_stack_size = COROUTINE_STACK_SIZE;
     co->unsafe_stack = qemu_alloc_stack(&co->unsafe_stack_size);
 #endif
-    co->base.entry_arg = &old_env; /* stash away our jmp_buf */
+    co->base.entry_arg = &caller_ctx; /* trampoline uses this to return */
 
     uc.uc_link = &old_uc;
     uc.uc_stack.ss_sp = co->stack;
@@ -222,29 +255,20 @@ Coroutine *qemu_coroutine_new(void)
     makecontext(&uc, (void (*)(void))coroutine_trampoline,
                 2, arg.i[0], arg.i[1]);
 
-    /* swapcontext() in, siglongjmp() back out */
-    if (!sigsetjmp(old_env, 0)) {
-        start_switch_fiber_asan(&fake_stack_save, co->stack, co->stack_size);
-        start_switch_fiber_tsan(&fake_stack_save,
-                                co, false); /* false=not caller */
+    /* Enter the trampoline. It will:
+     * 1. Save its context into co->env
+     * 2. swapcontext back to caller_ctx, returning us here
+     * After this, co->env is ready for qemu_coroutine_switch(). */
+    start_switch_fiber_asan(&fake_stack_save, co->stack, co->stack_size);
+    start_switch_fiber_tsan(&fake_stack_save,
+                            co, false); /* false=not caller */
 
 #ifdef CONFIG_SAFESTACK
-        /*
-         * Before we swap the context, set the new unsafe stack
-         * The unsafe stack grows just like the normal stack, so start from
-         * the last usable location of the memory area.
-         * NOTE: we don't have to re-set the usp afterwards because we are
-         * coming back to this context through a siglongjmp.
-         * The compiler already wrapped the corresponding sigsetjmp call with
-         * code that saves the usp on the (safe) stack before the call, and
-         * restores it right after (which is where we return with siglongjmp).
-         */
-        void *usp = co->unsafe_stack + co->unsafe_stack_size;
-        __safestack_unsafe_stack_ptr = usp;
+    void *usp = co->unsafe_stack + co->unsafe_stack_size;
+    __safestack_unsafe_stack_ptr = usp;
 #endif
 
-        swapcontext(&old_uc, &uc);
-    }
+    libucontext_swapcontext(&caller_ctx, &uc);
 
     finish_switch_fiber(fake_stack_save);
 
@@ -274,7 +298,8 @@ static void coroutine_fn terminate_asan(void *opaque)
     set_current(opaque);
     start_switch_fiber_asan(NULL, to->stack, to->stack_size);
     G_STATIC_ASSERT(!IS_ENABLED(CONFIG_TSAN));
-    siglongjmp(to->env, COROUTINE_ENTER);
+    to->action_on_entry = COROUTINE_ENTER;
+    libucontext_setcontext(&to->env);
 }
 #endif
 
@@ -303,7 +328,7 @@ void qemu_coroutine_delete(Coroutine *co_)
  * into coroutine_trampoline(). If we allow it to do that then it
  * hoists the code to get the address of the TLS variable "current"
  * out of the while() loop. This is an invalid transformation because
- * the sigsetjmp() call may be called when running thread A but
+ * the context switch may be called when running thread A but
  * return in thread B, and so we might be in a different thread
  * context each time round the loop.
  */
@@ -313,25 +338,33 @@ qemu_coroutine_switch(Coroutine *from_, Coroutine *to_,
 {
     CoroutineUContext *from = DO_UPCAST(CoroutineUContext, base, from_);
     CoroutineUContext *to = DO_UPCAST(CoroutineUContext, base, to_);
-    int ret;
     void *fake_stack_save = NULL;
 
     set_current(to_);
 
-    ret = sigsetjmp(from->env, 0);
-    if (ret == 0) {
-        start_switch_fiber_asan(IS_ENABLED(CONFIG_COROUTINE_POOL) ||
-                                action != COROUTINE_TERMINATE ?
-                                    &fake_stack_save : NULL,
-                                to->stack, to->stack_size);
-        start_switch_fiber_tsan(&fake_stack_save,
-                                to, false); /* false=not caller */
-        siglongjmp(to->env, action);
-    }
+    /*
+     * Use libucontext_swapcontext instead of sigsetjmp/siglongjmp.
+     * Android bionic's siglongjmp mangles saved SP/PC with a per-thread
+     * pointer guard cookie, which causes SIGILL when switching between
+     * coroutine stacks. libucontext doesn't mangle pointers.
+     *
+     * We store the action in to_->caller temporarily so the target
+     * coroutine can retrieve it after the context switch.
+     */
+    to->action_on_entry = action;
+
+    start_switch_fiber_asan(IS_ENABLED(CONFIG_COROUTINE_POOL) ||
+                            action != COROUTINE_TERMINATE ?
+                                &fake_stack_save : NULL,
+                            to->stack, to->stack_size);
+    start_switch_fiber_tsan(&fake_stack_save,
+                            to, false); /* false=not caller */
+
+    libucontext_swapcontext(&from->env, &to->env);
 
     finish_switch_fiber(fake_stack_save);
 
-    return ret;
+    return from->action_on_entry;
 }
 
 Coroutine *qemu_coroutine_self(void)
