@@ -36,6 +36,17 @@ static const char *kLogTag = "QEMU-OUT";
 static int g_forward_fd = -1;
 static pthread_mutex_t g_forward_fd_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static char *g_resolv_conf_path = NULL;
+static pthread_mutex_t g_resolv_conf_lock = PTHREAD_MUTEX_INITIALIZER;
+
+__attribute__((visibility("default")))
+const char *android_get_resolv_conf_path(void) {
+    pthread_mutex_lock(&g_resolv_conf_lock);
+    const char *p = g_resolv_conf_path;
+    pthread_mutex_unlock(&g_resolv_conf_lock);
+    return p;
+}
+
 static int get_forward_fd(void) {
     pthread_mutex_lock(&g_forward_fd_lock);
     int fd = g_forward_fd;
@@ -241,10 +252,32 @@ Java_com_vectras_qemu_jni_Loader_setLogCallback(JNIEnv *env, jclass clazz, jobje
     }
 }
 
+JNIEXPORT void JNICALL
+Java_com_vectras_qemu_jni_Loader_setResolvConfPath(JNIEnv *env, jclass clazz, jstring path) {
+    (void)clazz;
+    pthread_mutex_lock(&g_resolv_conf_lock);
+    free(g_resolv_conf_path);
+    g_resolv_conf_path = NULL;
+    if (path) {
+        const char *str = (*env)->GetStringUTFChars(env, path, 0);
+        if (str) {
+            g_resolv_conf_path = strdup(str);
+            __android_log_print(ANDROID_LOG_INFO, "QEMU-system",
+                                "resolv.conf path set to: %s", g_resolv_conf_path);
+            (*env)->ReleaseStringUTFChars(env, path, str);
+        }
+    }
+    pthread_mutex_unlock(&g_resolv_conf_lock);
+}
+
 JNIEXPORT void JNICALL JNI_OnUnload(JavaVM *vm, void *reserved) {
     (void)vm;
     (void)reserved;
     set_forward_fd(-1);
+    pthread_mutex_lock(&g_resolv_conf_lock);
+    free(g_resolv_conf_path);
+    g_resolv_conf_path = NULL;
+    pthread_mutex_unlock(&g_resolv_conf_lock);
 }
 
 
