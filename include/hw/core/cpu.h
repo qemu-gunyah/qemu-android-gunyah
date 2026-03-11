@@ -596,7 +596,13 @@ extern CPUTailQ cpus_queue;
 #define CPU_FOREACH_SAFE(cpu, next_cpu) \
     QTAILQ_FOREACH_SAFE_RCU(cpu, &cpus_queue, node, next_cpu)
 
+#ifdef __ANDROID__
+/* Android: __thread in dlopen'd .so corrupts TLS. Use pthread_key. */
+CPUState **android_current_cpu_ptr(void);
+#define current_cpu (*android_current_cpu_ptr())
+#else
 extern __thread CPUState *current_cpu;
+#endif
 
 /**
  * qemu_tcg_mttcg_enabled:

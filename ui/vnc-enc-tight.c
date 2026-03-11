@@ -1458,8 +1458,10 @@ static int send_sub_rect_jpeg(VncState *vs, int x, int y, int w, int h,
 }
 #endif
 
-static __thread VncPalette *color_count_palette;
-static __thread Notifier vnc_tight_cleanup_notifier;
+/* Android: avoid __thread in dlopen'd .so — shifts TLS block layout
+ * and corrupts existing TLS vars (current_cpu, tcg_ctx, etc.) */
+static VncPalette *color_count_palette;
+static Notifier vnc_tight_cleanup_notifier;
 
 static void vnc_tight_cleanup(Notifier *n, void *value)
 {

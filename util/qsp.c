@@ -104,8 +104,28 @@ typedef struct QSPSnapshot QSPSnapshot;
 /* this file's full path. Used to present all call sites with relative paths */
 static size_t qsp_qemu_path_len;
 
-/* the address of qsp_thread gives us a unique 'thread ID' */
+/* Android: __thread in dlopen'd .so corrupts TLS block.
+ * Use pthread_key for per-thread identity (address used as thread ID). */
+#ifdef __ANDROID__
+#include <pthread.h>
+static pthread_key_t qsp_thread_key;
+static pthread_once_t qsp_thread_once = PTHREAD_ONCE_INIT;
+static void qsp_thread_key_init(void) {
+    pthread_key_create(&qsp_thread_key, free);
+}
+static int *qsp_thread_ptr(void) {
+    pthread_once(&qsp_thread_once, qsp_thread_key_init);
+    int *p = (int *)pthread_getspecific(qsp_thread_key);
+    if (!p) {
+        p = (int *)calloc(1, sizeof(int));
+        pthread_setspecific(qsp_thread_key, p);
+    }
+    return p;
+}
+#define qsp_thread (*qsp_thread_ptr())
+#else
 static __thread int qsp_thread;
+#endif
 
 /*
  * Call sites are the same for all threads, so we track them in a separate hash

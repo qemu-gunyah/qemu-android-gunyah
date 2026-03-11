@@ -36,7 +36,25 @@
 # define tci_assert(cond) ((void)(cond))
 #endif
 
+#ifdef __ANDROID__
+#include <pthread.h>
+static pthread_key_t tci_tb_ptr_key;
+static pthread_once_t tci_tb_ptr_once = PTHREAD_ONCE_INIT;
+static void tci_tb_ptr_key_init(void) {
+    pthread_key_create(&tci_tb_ptr_key, free);
+}
+uintptr_t *android_tci_tb_ptr_ptr(void) {
+    pthread_once(&tci_tb_ptr_once, tci_tb_ptr_key_init);
+    uintptr_t *p = (uintptr_t *)pthread_getspecific(tci_tb_ptr_key);
+    if (!p) {
+        p = (uintptr_t *)calloc(1, sizeof(uintptr_t));
+        pthread_setspecific(tci_tb_ptr_key, p);
+    }
+    return p;
+}
+#else
 __thread uintptr_t tci_tb_ptr;
+#endif
 
 static void tci_write_reg64(tcg_target_ulong *regs, uint32_t high_index,
                             uint32_t low_index, uint64_t value)

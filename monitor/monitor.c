@@ -425,8 +425,9 @@ void qapi_event_emit(QAPIEvent event, QDict *qdict)
         QDict *qdict;
         QSIMPLEQ_ENTRY(MonitorQapiEvent) entry;
     } MonitorQapiEvent;
-    static __thread QSIMPLEQ_HEAD(, MonitorQapiEvent) event_queue;
-    static __thread bool reentered;
+    /* Android: __thread in dlopen'd .so corrupts TLS block */
+    static QSIMPLEQ_HEAD(, MonitorQapiEvent) event_queue;
+    static bool reentered;
     MonitorQapiEvent *ev;
 
     if (!reentered) {

@@ -74,7 +74,8 @@ static void get_host_pc_size(uintptr_t *host_pc, uint16_t *host_size,
 
 static const char *pretty_symbol(const struct debuginfo_query *q, size_t *len)
 {
-    static __thread char buf[64];
+    /* Android: __thread in dlopen'd .so corrupts TLS block */
+    static char buf[64];
     int tmp;
 
     if (!q->symbol) {

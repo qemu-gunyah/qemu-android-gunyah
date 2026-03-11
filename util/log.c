@@ -41,8 +41,9 @@ typedef struct RCUCloseFILE {
 static QemuMutex global_mutex;
 static char *global_filename;
 static FILE *global_file;
-static __thread FILE *thread_file;
-static __thread Notifier qemu_log_thread_cleanup_notifier;
+/* Android: __thread in dlopen'd .so corrupts TLS block */
+static FILE *thread_file;
+static Notifier qemu_log_thread_cleanup_notifier;
 
 int qemu_loglevel;
 static bool log_per_thread;

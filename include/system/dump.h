@@ -62,6 +62,13 @@ typedef struct QEMU_PACKED NewUtsname {
     char domainname[65];
 } NewUtsname;
 
+/* Android: temporarily undef current_cpu macro to avoid conflict with
+ * struct field names in the kdump binary format */
+#ifdef __ANDROID__
+#pragma push_macro("current_cpu")
+#undef current_cpu
+#endif
+
 typedef struct QEMU_PACKED DiskDumpHeader32 {
     char signature[SIG_LEN];        /* = "KDUMP   " */
     uint32_t header_version;        /* Dump header version */
@@ -97,6 +104,10 @@ typedef struct QEMU_PACKED DiskDumpHeader64 {
     uint32_t current_cpu;           /* CPU# which handles dump */
     uint32_t nr_cpus;               /* Number of CPUs */
 } DiskDumpHeader64;
+
+#ifdef __ANDROID__
+#pragma pop_macro("current_cpu")
+#endif
 
 typedef struct QEMU_PACKED KdumpSubHeader32 {
     uint32_t phys_base;

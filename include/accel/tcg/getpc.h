@@ -14,7 +14,12 @@
 
 /* GETPC is the true target of the return instruction that we'll execute.  */
 #ifdef CONFIG_TCG_INTERPRETER
+# ifdef __ANDROID__
+uintptr_t *android_tci_tb_ptr_ptr(void);
+#  define tci_tb_ptr (*android_tci_tb_ptr_ptr())
+# else
 extern __thread uintptr_t tci_tb_ptr;
+# endif
 # define GETPC() tci_tb_ptr
 #else
 # define GETPC() \

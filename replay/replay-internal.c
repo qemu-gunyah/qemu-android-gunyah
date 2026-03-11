@@ -196,7 +196,8 @@ void replay_finish_event(void)
     replay_fetch_data_kind();
 }
 
-static __thread bool replay_locked;
+/* Android: __thread in dlopen'd .so corrupts TLS block */
+static bool replay_locked;
 
 void replay_mutex_init(void)
 {

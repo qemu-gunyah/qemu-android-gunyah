@@ -121,7 +121,25 @@ CPUState *qemu_get_cpu(int index)
 }
 
 /* current CPU in the current thread. It is only valid inside cpu_exec() */
+#ifdef __ANDROID__
+#include <pthread.h>
+static pthread_key_t current_cpu_key;
+static pthread_once_t current_cpu_once = PTHREAD_ONCE_INIT;
+static void current_cpu_key_init(void) {
+    pthread_key_create(&current_cpu_key, free);
+}
+CPUState **android_current_cpu_ptr(void) {
+    pthread_once(&current_cpu_once, current_cpu_key_init);
+    CPUState **p = (CPUState **)pthread_getspecific(current_cpu_key);
+    if (!p) {
+        p = (CPUState **)calloc(1, sizeof(CPUState *));
+        pthread_setspecific(current_cpu_key, p);
+    }
+    return p;
+}
+#else
 __thread CPUState *current_cpu;
+#endif
 
 struct qemu_work_item {
     QSIMPLEQ_ENTRY(qemu_work_item) node;

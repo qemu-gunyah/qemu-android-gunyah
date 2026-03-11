@@ -46,8 +46,8 @@ static void defer_call_atexit(Notifier *n, void *value)
     g_array_free(thread_state->deferred_call_array, TRUE);
 }
 
-/* This won't involve coroutines, so use __thread */
-static __thread Notifier defer_call_atexit_notifier;
+/* Android: __thread in dlopen'd .so corrupts TLS block */
+static Notifier defer_call_atexit_notifier;
 
 /**
  * defer_call:

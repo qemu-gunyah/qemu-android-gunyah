@@ -29,8 +29,26 @@
 
 static bool name_threads;
 
-// __thread NotifierList thread_exit = { .notifiers = { .lh_first = NULL } };
+#ifdef __ANDROID__
+#include <pthread.h>
+static pthread_key_t thread_exit_key;
+static pthread_once_t thread_exit_once = PTHREAD_ONCE_INIT;
+static void thread_exit_key_init(void) {
+    pthread_key_create(&thread_exit_key, free);
+}
+static NotifierList *android_thread_exit_ptr(void) {
+    pthread_once(&thread_exit_once, thread_exit_key_init);
+    NotifierList *p = (NotifierList *)pthread_getspecific(thread_exit_key);
+    if (!p) {
+        p = (NotifierList *)calloc(1, sizeof(NotifierList));
+        pthread_setspecific(thread_exit_key, p);
+    }
+    return p;
+}
+#define thread_exit (*android_thread_exit_ptr())
+#else
 __thread NotifierList thread_exit;
+#endif
 
 void qemu_thread_naming(bool enable)
 {
@@ -72,15 +90,14 @@ static void compute_abs_deadline(struct timespec *ts, int ms)
     }
 }
 
-/* Add this function in qemu-thread-posix.c */
 void qemu_thread_init_tls(void)
 {
-    /* Android Samsung linker bug: __thread variables in dlopen'd .so
-     * may not be properly initialized from the TLS image.
-     * Force-zero all __thread NotifierLists and other critical TLS. */
+#ifdef __ANDROID__
+    /* pthread_key-based TLS is auto-zeroed on first access */
+    (void)android_thread_exit_ptr();
+#else
     memset(&thread_exit, 0, sizeof(thread_exit));
-    //LOGI("NLI thread_exit: listaaa=%p\n", &thread_exit);
-
+#endif
 }
 
 void qemu_mutex_init(QemuMutex *mutex)

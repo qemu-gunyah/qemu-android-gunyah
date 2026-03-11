@@ -242,7 +242,25 @@ bool tcg_use_softmmu;
 #endif
 
 TCGContext tcg_init_ctx;
+#ifdef __ANDROID__
+#include <pthread.h>
+static pthread_key_t tcg_ctx_key;
+static pthread_once_t tcg_ctx_once = PTHREAD_ONCE_INIT;
+static void tcg_ctx_key_init(void) {
+    pthread_key_create(&tcg_ctx_key, free);
+}
+TCGContext **android_tcg_ctx_ptr(void) {
+    pthread_once(&tcg_ctx_once, tcg_ctx_key_init);
+    TCGContext **p = (TCGContext **)pthread_getspecific(tcg_ctx_key);
+    if (!p) {
+        p = (TCGContext **)calloc(1, sizeof(TCGContext *));
+        pthread_setspecific(tcg_ctx_key, p);
+    }
+    return p;
+}
+#else
 __thread TCGContext *tcg_ctx;
+#endif
 
 TCGContext **tcg_ctxs;
 unsigned int tcg_cur_ctxs;

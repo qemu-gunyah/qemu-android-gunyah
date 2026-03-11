@@ -10,59 +10,93 @@
 #include "qemu/rcu_queue.h"
 
 /*
- * These thread-local variables are used only in fdmon_poll_wait() around the
- * call to the poll() system call.  In particular they are not used while
- * aio_poll is performing callbacks, which makes it much easier to think about
- * reentrancy!
+ * These variables are per-thread poll state used only in fdmon_poll_wait()
+ * around the call to the poll() system call.
  *
- * Stack-allocated arrays would be perfect but they have size limitations;
- * heap allocation is expensive enough that we want to reuse arrays across
- * calls to aio_poll().  And because poll() has to be called without holding
- * any lock, the arrays cannot be stored in AioContext.  Thread-local data
- * has none of the disadvantages of these three options.
+ * Android: __thread in dlopen'd .so corrupts TLS block layout.
+ * Use pthread_key_t instead.
  */
-static __thread GPollFD *pollfds;
-static __thread AioHandler **nodes;
-static __thread unsigned npfd, nalloc;
-static __thread Notifier pollfds_cleanup_notifier;
+#include <pthread.h>
+
+typedef struct FdmonPollState {
+    GPollFD *pollfds;
+    AioHandler **nodes;
+    unsigned npfd;
+    unsigned nalloc;
+    Notifier cleanup_notifier;
+} FdmonPollState;
+
+static pthread_key_t fdmon_poll_key;
+static pthread_once_t fdmon_poll_once = PTHREAD_ONCE_INIT;
+
+static void fdmon_poll_state_destroy(void *ptr)
+{
+    FdmonPollState *s = ptr;
+    if (s) {
+        g_free(s->pollfds);
+        g_free(s->nodes);
+        g_free(s);
+    }
+}
+
+static void fdmon_poll_key_init(void)
+{
+    pthread_key_create(&fdmon_poll_key, fdmon_poll_state_destroy);
+}
+
+static FdmonPollState *fdmon_poll_get_state(void)
+{
+    pthread_once(&fdmon_poll_once, fdmon_poll_key_init);
+    FdmonPollState *s = pthread_getspecific(fdmon_poll_key);
+    if (!s) {
+        s = g_new0(FdmonPollState, 1);
+        pthread_setspecific(fdmon_poll_key, s);
+    }
+    return s;
+}
 
 static void pollfds_cleanup(Notifier *n, void *unused)
 {
-    g_assert(npfd == 0);
-    g_free(pollfds);
-    g_free(nodes);
-    nalloc = 0;
+    FdmonPollState *s = fdmon_poll_get_state();
+    g_assert(s->npfd == 0);
+    g_free(s->pollfds);
+    g_free(s->nodes);
+    s->pollfds = NULL;
+    s->nodes = NULL;
+    s->nalloc = 0;
 }
 
 static void add_pollfd(AioHandler *node)
 {
-    if (npfd == nalloc) {
-        if (nalloc == 0) {
-            pollfds_cleanup_notifier.notify = pollfds_cleanup;
-            qemu_thread_atexit_add(&pollfds_cleanup_notifier);
-            nalloc = 8;
+    FdmonPollState *s = fdmon_poll_get_state();
+    if (s->npfd == s->nalloc) {
+        if (s->nalloc == 0) {
+            s->cleanup_notifier.notify = pollfds_cleanup;
+            qemu_thread_atexit_add(&s->cleanup_notifier);
+            s->nalloc = 8;
         } else {
-            g_assert(nalloc <= INT_MAX);
-            nalloc *= 2;
+            g_assert(s->nalloc <= INT_MAX);
+            s->nalloc *= 2;
         }
-        pollfds = g_renew(GPollFD, pollfds, nalloc);
-        nodes = g_renew(AioHandler *, nodes, nalloc);
+        s->pollfds = g_renew(GPollFD, s->pollfds, s->nalloc);
+        s->nodes = g_renew(AioHandler *, s->nodes, s->nalloc);
     }
-    nodes[npfd] = node;
-    pollfds[npfd] = (GPollFD) {
+    s->nodes[s->npfd] = node;
+    s->pollfds[s->npfd] = (GPollFD) {
         .fd = node->pfd.fd,
         .events = node->pfd.events,
     };
-    npfd++;
+    s->npfd++;
 }
 
 static int fdmon_poll_wait(AioContext *ctx, AioHandlerList *ready_list,
                             int64_t timeout)
 {
+    FdmonPollState *s = fdmon_poll_get_state();
     AioHandler *node;
     int ret;
 
-    assert(npfd == 0);
+    assert(s->npfd == 0);
 
     QLIST_FOREACH_RCU(node, &ctx->aio_handlers, node) {
         if (!QLIST_IS_INSERTED(node, node_deleted) && node->pfd.events) {
@@ -71,25 +105,25 @@ static int fdmon_poll_wait(AioContext *ctx, AioHandlerList *ready_list,
     }
 
     /* epoll(7) is faster above a certain number of fds */
-    if (fdmon_epoll_try_upgrade(ctx, npfd)) {
-        npfd = 0; /* we won't need pollfds[], reset npfd */
+    if (fdmon_epoll_try_upgrade(ctx, s->npfd)) {
+        s->npfd = 0; /* we won't need pollfds[], reset npfd */
         return ctx->fdmon_ops->wait(ctx, ready_list, timeout);
     }
 
-    ret = qemu_poll_ns(pollfds, npfd, timeout);
+    ret = qemu_poll_ns(s->pollfds, s->npfd, timeout);
     if (ret > 0) {
         int i;
 
-        for (i = 0; i < npfd; i++) {
-            int revents = pollfds[i].revents;
+        for (i = 0; i < s->npfd; i++) {
+            int revents = s->pollfds[i].revents;
 
             if (revents) {
-                aio_add_ready_handler(ready_list, nodes[i], revents);
+                aio_add_ready_handler(ready_list, s->nodes[i], revents);
             }
         }
     }
 
-    npfd = 0;
+    s->npfd = 0;
     return ret;
 }
 

@@ -46,7 +46,8 @@ uint64_t qemu_plugin_entry_code(void)
  * Virtual Memory queries
  */
 
-static __thread struct qemu_plugin_hwaddr hwaddr_info;
+/* Android: __thread in dlopen'd .so corrupts TLS block */
+static struct qemu_plugin_hwaddr hwaddr_info;
 
 struct qemu_plugin_hwaddr *qemu_plugin_get_hwaddr(qemu_plugin_meminfo_t info,
                                                   uint64_t vaddr)

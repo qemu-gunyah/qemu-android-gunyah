@@ -723,7 +723,8 @@ void *qemu_alloc_stack(size_t *sz)
 }
 
 #ifdef CONFIG_DEBUG_STACK_USAGE
-static __thread unsigned int max_stack_usage;
+/* Android: __thread in dlopen'd .so corrupts TLS block */
+static unsigned int max_stack_usage;
 #endif
 
 void qemu_free_stack(void *stack, size_t sz)

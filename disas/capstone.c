@@ -14,7 +14,8 @@
  * malloc with a size private to the library; thus there's no reason not
  * to share this across calls and across host vs target disassembly.
  */
-static __thread cs_insn *cap_insn;
+/* Android: __thread in dlopen'd .so corrupts TLS block */
+static cs_insn *cap_insn;
 
 /*
  * The capstone library always skips 2 bytes for S390X.

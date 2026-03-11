@@ -454,7 +454,12 @@ extern bool tcg_use_softmmu;
 #define tcg_use_softmmu  true
 #endif
 
+#ifdef __ANDROID__
+TCGContext **android_tcg_ctx_ptr(void);
+#define tcg_ctx (*android_tcg_ctx_ptr())
+#else
 extern __thread TCGContext *tcg_ctx;
+#endif
 extern const void *tcg_code_gen_epilogue;
 extern uintptr_t tcg_splitwx_diff;
 extern TCGv_env tcg_env;
