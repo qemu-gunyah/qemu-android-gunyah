@@ -429,7 +429,7 @@ EGLSurface qemu_egl_init_surface_x11(EGLContext ectx, EGLNativeWindowType win)
 
 /* ---------------------------------------------------------------------- */
 
-#if defined(CONFIG_X11) || defined(CONFIG_GBM) || defined(WIN32)
+#if defined(CONFIG_X11) || defined(CONFIG_GBM) || defined(WIN32) || defined(__ANDROID__)
 
 /*
  * Taken from glamor_egl.h from the Xorg xserver, which is MIT licensed
@@ -598,6 +598,21 @@ int qemu_egl_init_dpy_win32(EGLNativeDisplayType dpy, DisplayGLMode mode)
 }
 #endif
 
+#ifdef __ANDROID__
+static int qemu_egl_init_dpy_android(DisplayGLMode mode)
+{
+    /*
+     * Android only supports OpenGL ES (no desktop GL).
+     * Use EGL_DEFAULT_DISPLAY -- Android's EGL implementation
+     * provides GPU access without DRM/GBM.
+     */
+    if (mode == DISPLAY_GL_MODE_ON) {
+        mode = DISPLAY_GL_MODE_ES;
+    }
+    return qemu_egl_init_dpy((EGLNativeDisplayType)EGL_DEFAULT_DISPLAY, 0, mode);
+}
+#endif
+
 bool qemu_egl_has_dmabuf(void)
 {
     if (qemu_egl_display == EGL_NO_DISPLAY) {
@@ -650,6 +665,16 @@ bool egl_init(const char *rendernode, DisplayGLMode mode, Error **errp)
 #ifdef WIN32
     if (qemu_egl_init_dpy_win32(EGL_DEFAULT_DISPLAY, mode) < 0) {
         error_setg(errp, "egl: init failed");
+        return false;
+    }
+    qemu_egl_rn_ctx = qemu_egl_init_ctx();
+    if (!qemu_egl_rn_ctx) {
+        error_setg(errp, "egl: egl_init_ctx failed");
+        return false;
+    }
+#elif defined(__ANDROID__)
+    if (qemu_egl_init_dpy_android(mode) < 0) {
+        error_setg(errp, "egl: android EGL init failed");
         return false;
     }
     qemu_egl_rn_ctx = qemu_egl_init_ctx();
