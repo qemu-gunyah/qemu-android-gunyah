@@ -45,6 +45,7 @@
 #include "system/tcg.h"
 #include "system/qtest.h"
 #include "system/hw_accel.h"
+#include "system/gunyah.h"
 #include "kvm_arm.h"
 #include "disas/capstone.h"
 #include "fpu/softfloat.h"
@@ -1530,8 +1531,8 @@ static void arm_cpu_initfn(Object *obj)
     cpu->psci_version = QEMU_PSCI_VERSION_0_1; /* By default assume PSCI v0.1 */
     cpu->kvm_target = QEMU_KVM_ARM_TARGET_NONE;
 
-    if (tcg_enabled() || hvf_enabled()) {
-        /* TCG and HVF implement PSCI 1.1 */
+    if (tcg_enabled() || hvf_enabled() || gunyah_enabled()) {
+        /* TCG, HVF, and Gunyah implement PSCI 1.1 */
         cpu->psci_version = QEMU_PSCI_VERSION_1_1;
     }
 }
@@ -1982,8 +1983,8 @@ static void arm_cpu_realizefn(DeviceState *dev, Error **errp)
      * this is the first point where we can report it.
      */
     if (cpu->host_cpu_probe_failed) {
-        if (!kvm_enabled() && !hvf_enabled()) {
-            error_setg(errp, "The 'host' CPU type can only be used with KVM or HVF");
+        if (!kvm_enabled() && !hvf_enabled() && !gunyah_enabled()) {
+            error_setg(errp, "The 'host' CPU type can only be used with KVM, HVF, or Gunyah");
         } else {
             error_setg(errp, "Failed to retrieve host CPU features");
         }

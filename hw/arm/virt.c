@@ -29,6 +29,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <sys/stat.h>
 #include "qemu/datadir.h"
 #include "qemu/units.h"
 #include "qemu/option.h"
@@ -43,12 +44,17 @@
 #include "hw/display/ramfb.h"
 #include "net/net.h"
 #include "system/device_tree.h"
+#include <libfdt.h>
 #include "system/numa.h"
 #include "system/runstate.h"
 #include "system/tpm.h"
 #include "system/tcg.h"
 #include "system/kvm.h"
 #include "system/hvf.h"
+#include "system/gunyah.h"
+#include "system/gunyah_int.h"
+#include "system/confidential-guest-support.h"
+#include "qom/object_interfaces.h"
 #include "system/qtest.h"
 #include "hw/loader.h"
 #include "qapi/error.h"
@@ -598,8 +604,14 @@ static void fdt_add_gic_node(VirtMachineState *vms)
         qemu_fdt_setprop_string(ms->fdt, nodename, "compatible",
                                 "arm,gic-v3");
 
-        qemu_fdt_setprop_cell(ms->fdt, nodename,
-                              "#redistributor-regions", nb_redist_regions);
+        /*
+         * Gunyah RM doesn't expect #redistributor-regions in the GIC node.
+         * CrosVM doesn't set it either. Only set for non-Gunyah.
+         */
+        if (!gunyah_enabled()) {
+            qemu_fdt_setprop_cell(ms->fdt, nodename,
+                                  "#redistributor-regions", nb_redist_regions);
+        }
 
         if (nb_redist_regions == 1) {
             qemu_fdt_setprop_sized_cells(ms->fdt, nodename, "reg",
@@ -717,6 +729,9 @@ static void create_its(VirtMachineState *vms)
         if (!vms->tcg_its) {
             itsclass = NULL;
         }
+    } else if (!strcmp(itsclass, "arm-its-gunyah")) {
+        /* ITS is not yet supported on Gunyah */
+        itsclass = NULL;
     }
 
     if (!itsclass) {
@@ -1238,6 +1253,20 @@ static void virt_flash_map1(PFlashCFI01 *flash,
     qdev_prop_set_uint32(dev, "num-blocks", size / VIRT_FLASH_SECTOR_SIZE);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
 
+    /*
+     * Under Gunyah, do NOT map pflash into system memory.  The pflash
+     * device toggles between ROMD and MMIO modes on each access, and
+     * every toggle fires the memory listener → gunyah_set_phys_mem.
+     * Since Gunyah traps all accesses below 1 GiB as MMIO exits, the
+     * vCPU gets stuck in a tight loop: MMIO exit → pflash handler →
+     * mode toggle → listener callback → re-execute → MMIO exit.
+     * The device is realized above (satisfying qdev assertions) but
+     * kept unmapped so no guest access can reach it.
+     */
+    if (gunyah_enabled()) {
+        return;
+    }
+
     memory_region_add_subregion(sysmem, base,
                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(dev),
                                                        0));
@@ -1695,7 +1724,12 @@ static void *machvirt_dtb(const struct arm_boot_info *binfo, int *fdt_size)
                                                  bootinfo);
     MachineState *ms = MACHINE(board);
 
-
+    /*
+     * Return the actual FDT buffer size (1MB = FDT_MAX_SIZE).
+     * For Gunyah, the 2MB reservation is communicated separately to RM
+     * via gunyah_arm_set_dtb(). The extra 1MB is just zeroed guest RAM
+     * that RM can use for its DTB overlay.
+     */
     *fdt_size = board->fdt_size;
     return ms->fdt;
 }
@@ -1712,6 +1746,8 @@ static void virt_build_smbios(VirtMachineState *vms)
 
     if (kvm_enabled()) {
         product = "KVM Virtual Machine";
+    } else if (gunyah_enabled()) {
+        product = "Gunyah Virtual Machine";
     }
 
     smbios_set_defaults("QEMU", product,
@@ -1757,8 +1793,54 @@ void virt_machine_done(Notifier *notifier, void *data)
                                        vms->memmap[VIRT_PLATFORM_BUS].size,
                                        vms->irqmap[VIRT_PLATFORM_BUS]);
     }
+
+    if (gunyah_enabled()) {
+        /*
+         * CrosVM places the DTB at the end of main_memory_size, which
+         * EXCLUDES swiotlb. This is critical: the DTB must be in the
+         * LEND region, not the SHARE region.
+         *
+         * CrosVM: memory_end = PHYS_MEM_START + (total - swiotlb)
+         *         fdt_address = memory_end - FDT_MAX_SIZE
+         *
+         * The config image parcel is created from the binding containing
+         * the DTB GPA. If DTB is in the LEND binding, the parcel uses
+         * MEM_LEND (1 ACL entry). If DTB is in the SHARE binding, it
+         * uses MEM_SHARE (2 ACL entries). RM rejects VM_INIT with
+         * NORESOURCE if the config image is SHARED instead of LENT.
+         */
+        GUNYAHState *gs = GUNYAH_STATE(current_accel());
+        uint64_t gunyah_dtb_size = 0x200000; /* 2MB, matches CrosVM */
+        uint64_t main_mem_size = ms->ram_size;
+        if (gs->protected_vm && gs->swiotlb_size) {
+            main_mem_size -= gs->swiotlb_size;
+        }
+        uint64_t mem_end = info->loader_start + main_mem_size;
+
+        info->dtb_start = QEMU_ALIGN_DOWN(mem_end - gunyah_dtb_size,
+                                           gunyah_dtb_size);
+        info->dtb_limit = 0; /* no limit */
+        error_report("GH: DTB placed at end of LEND region (matches CrosVM): "
+                     "dtb_start=0x%"PRIx64" dtb_size=0x%"PRIx64
+                     " main_mem=0x%"PRIx64" swiotlb=0x%"PRIx64,
+                     (uint64_t)info->dtb_start, gunyah_dtb_size,
+                     main_mem_size, gs->swiotlb_size);
+    }
+
     if (arm_load_dtb(info->dtb_start, info, info->dtb_limit, as, ms, cpu) < 0) {
         exit(1);
+    }
+
+    if (gunyah_enabled()) {
+        /*
+         * Tell Gunyah RM where the DTB is and how much space is reserved.
+         * CrosVM always passes 0x200000 (2MB) as dtb_size, NOT the packed
+         * FDT size. RM needs room to apply its overlay.
+         */
+        uint64_t gunyah_dtb_size = 0x200000; /* 2MB, matches CrosVM */
+        if (gunyah_arm_set_dtb(info->dtb_start, gunyah_dtb_size)) {
+            exit(1);
+        }
     }
 
     pci_bus_add_fw_cfg_extra_pci_roots(vms->fw_cfg, vms->bus,
@@ -1853,6 +1935,14 @@ static void virt_set_memmap(VirtMachineState *vms, int pa_bits)
 
     for (i = 0; i < ARRAY_SIZE(base_memmap); i++) {
         vms->memmap[i] = base_memmap[i];
+    }
+
+    /*
+     * Workaround until Gunyah can accept mapping that starts from GiB.
+     * Move RAM base to 2 GiB for Gunyah VMs.
+     */
+    if (gunyah_enabled()) {
+        vms->memmap[VIRT_MEM].base = 2 * GiB;
     }
 
     if (ms->ram_slots > ACPI_MAX_RAM_SLOTS) {
@@ -2014,6 +2104,9 @@ static void finalize_gic_version(VirtMachineState *vms)
         /* KVM w/o kernel irqchip can only deal with GICv2 */
         gics_supported |= VIRT_GIC_VERSION_2_MASK;
         accel_name = "KVM with kernel-irqchip=off";
+    } else if (gunyah_enabled()) {
+        /* Gunyah only supports GICv3 via in-hypervisor vGIC */
+        gics_supported |= VIRT_GIC_VERSION_3_MASK;
     } else if (tcg_enabled() || hvf_enabled() || qtest_enabled())  {
         gics_supported |= VIRT_GIC_VERSION_2_MASK;
         if (module_object_class_by_name("arm-gicv3")) {
@@ -2103,6 +2196,842 @@ static void virt_cpu_post_init(VirtMachineState *vms, MemoryRegion *sysmem)
     }
 }
 
+/*
+ * ARM Confidential Guest support for Gunyah.
+ *
+ * Usage:
+ *   -machine virt,confidential-guest-support=prot0 \
+ *   -object arm-confidential-guest,id=prot0,swiotlb-size=16777216
+ *
+ * This tells QEMU to run a protected VM with the given swiotlb
+ * (shared DMA buffer) size.  The swiotlb region is SHARE'd with
+ * the host; the rest of guest RAM is LEND'd (private).
+ */
+#define TYPE_ARM_CONFIDENTIAL_GUEST "arm-confidential-guest"
+OBJECT_DECLARE_SIMPLE_TYPE(ArmConfidentialGuestState, ARM_CONFIDENTIAL_GUEST)
+
+struct ArmConfidentialGuestState {
+    ConfidentialGuestSupport parent_obj;
+    hwaddr swiotlb_size;
+};
+
+static void
+arm_confidential_guest_instance_init(Object *obj)
+{
+    ArmConfidentialGuestState *acg = ARM_CONFIDENTIAL_GUEST(obj);
+
+    object_property_add_uint64_ptr(obj, "swiotlb-size", &acg->swiotlb_size,
+                                   OBJ_PROP_FLAG_READWRITE);
+}
+
+static const TypeInfo confidential_guest_info = {
+    .parent = TYPE_CONFIDENTIAL_GUEST_SUPPORT,
+    .name = TYPE_ARM_CONFIDENTIAL_GUEST,
+    .instance_size = sizeof(ArmConfidentialGuestState),
+    .instance_init = arm_confidential_guest_instance_init,
+    .interfaces = (InterfaceInfo[]) {
+        { TYPE_USER_CREATABLE },
+        { }
+    }
+};
+
+static void
+confidential_guest_register_types(void)
+{
+    type_register_static(&confidential_guest_info);
+}
+type_init(confidential_guest_register_types);
+
+/*
+ * Initialize confidential guest support.
+ *
+ * Called early in machvirt_init() when the user passes
+ *   -machine virt,confidential-guest-support=prot0
+ *   -object arm-confidential-guest,id=prot0,swiotlb-size=...
+ *
+ * This sets protected_vm=true on the Gunyah accelerator and
+ * configures the swiotlb size, achieving the same effect as
+ *   -accel gunyah,protected=on
+ * but using the standard QEMU confidential-guest-support mechanism.
+ */
+static int confidential_guest_init(MachineState *ms)
+{
+    ConfidentialGuestSupport *cgs = ms->cgs;
+    ArmConfidentialGuestState *obj;
+
+    if (!cgs) {
+        return 0;
+    }
+
+    obj = (ArmConfidentialGuestState *)
+        object_dynamic_cast(OBJECT(cgs), TYPE_ARM_CONFIDENTIAL_GUEST);
+
+    if (!obj) {
+        return 0;
+    }
+
+    if (!gunyah_enabled()) {
+        error_report("arm-confidential-guest requires -accel gunyah");
+        return -1;
+    }
+
+    if (obj->swiotlb_size > ms->ram_size) {
+        error_report("swiotlb-size (0x%"PRIx64") exceeds RAM size (0x%"PRIx64")",
+                     (uint64_t)obj->swiotlb_size, (uint64_t)ms->ram_size);
+        return -1;
+    }
+
+    /* Configure the Gunyah accelerator for protected VM mode */
+    {
+        GUNYAHState *s = GUNYAH_STATE(current_accel());
+        s->protected_vm = true;
+
+        if (obj->swiotlb_size) {
+            gunyah_set_swiotlb_size(obj->swiotlb_size);
+            error_report("GH: confidential-guest-support: "
+                         "protected_vm=true swiotlb=0x%"PRIx64,
+                         (uint64_t)obj->swiotlb_size);
+        } else {
+            error_report("GH: confidential-guest-support: "
+                         "protected_vm=true (no swiotlb specified, "
+                         "using default)");
+        }
+    }
+
+    cgs->ready = true;
+    return 0;
+}
+
+static void fdt_add_reserved_memory(VirtMachineState *vms)
+{
+    MachineState *ms = MACHINE(vms);
+    GUNYAHState *gs = GUNYAH_STATE(current_accel());
+    hwaddr membase = vms->memmap[VIRT_MEM].base;
+    hwaddr memsize = ms->ram_size;
+    hwaddr resv_start;
+    const char compat[] = "restricted-dma-pool";
+    char *nodename;
+
+    if (!gs->protected_vm || !gs->swiotlb_size) {
+        return;
+    }
+
+    nodename = g_strdup_printf("/reserved-memory");
+    qemu_fdt_add_subnode(ms->fdt, nodename);
+    qemu_fdt_setprop_cell(ms->fdt, nodename, "#address-cells", 2);
+    qemu_fdt_setprop_cell(ms->fdt, nodename, "#size-cells", 2);
+    qemu_fdt_setprop(ms->fdt, nodename, "ranges", NULL, 0);
+    g_free(nodename);
+
+    /*
+     * Place the restricted DMA pool at the end of RAM. The host shares
+     * this region with the guest so I/O (virtio, etc.) can use DMA.
+     * The rest of RAM is lent (private to the guest).
+     */
+    resv_start = membase + memsize - gs->swiotlb_size;
+    nodename = g_strdup_printf("/reserved-memory/restricted_dma_reserved@%"
+            PRIx64, resv_start);
+    qemu_fdt_add_subnode(ms->fdt, nodename);
+    qemu_fdt_setprop_sized_cells(ms->fdt, nodename, "reg",
+                                     2, resv_start,
+                                     2, gs->swiotlb_size);
+    qemu_fdt_setprop(ms->fdt, nodename, "compatible", compat, sizeof(compat));
+    g_free(nodename);
+}
+
+/*
+ * Strip and fix DTB for Gunyah to match CrosVM's DTB format.
+ *
+ * The Gunyah Resource Manager (RM) parses the VM's DTB and applies overlays.
+ * CrosVM generates a specific DTB format that RM expects. We need to:
+ * 1. Remove extra device nodes QEMU adds but CrosVM doesn't
+ * 2. Fix timer interrupt flags (LEVEL_LOW, not LEVEL_HI)
+ * 3. Fix CPU compatible string ("arm,armv8", not "arm,cortex-a57")
+ * 4. Fix PSCI to minimal format ("arm,psci-0.2" only)
+ * 5. Remove cpu-map topology node
+ * 6. Remove model property from root
+ * 7. Add __symbols__ node for RM overlay resolution
+ */
+static void virt_strip_dtb_for_gunyah(void *fdt, uint32_t gic_phandle)
+{
+    /*
+     * NOP (remove) device nodes that are not needed by the RM.
+     * Keep: /, memory, cpus, intc, timer, psci, chosen, gunyah-vm-config
+     */
+    static const char * const nodes_to_remove[] = {
+        "/platform-bus@c000000",
+        "/fw-cfg@9020000",
+        "/gpio-keys",
+        "/pl061@9030000",
+        "/pcie@10000000",
+        "/pl031@9010000",
+        /* Keep /pl011@9000000 — QEMU emulates PL011 UART via MMIO exits
+         * so the guest can use it for serial console output.
+         * Keep /apb-pclk — PL011 references this clock via its 'clocks'
+         * property; stripping it causes -EPROBE_DEFER in the driver. */
+        "/flash@0",
+        "/aliases",
+        NULL
+    };
+    int nodeoff, i, len;
+    char nodename[64];
+
+    for (i = 0; nodes_to_remove[i]; i++) {
+        nodeoff = fdt_path_offset(fdt, nodes_to_remove[i]);
+        if (nodeoff >= 0) {
+            fdt_nop_node(fdt, nodeoff);
+            error_report("GH: stripped DTB node %s", nodes_to_remove[i]);
+        }
+    }
+
+    /* Remove all virtio_mmio nodes */
+    for (i = 0; i < 32; i++) {
+        snprintf(nodename, sizeof(nodename), "/virtio_mmio@%x",
+                 0xa000000 + i * 0x200);
+        nodeoff = fdt_path_offset(fdt, nodename);
+        if (nodeoff >= 0) {
+            fdt_nop_node(fdt, nodeoff);
+        }
+    }
+    error_report("GH: stripped virtio_mmio nodes");
+
+    /*
+     * Fix root node: remove properties CrosVM doesn't set.
+     * CrosVM root: compatible="linux,dummy-virt", interrupt-parent, #*-cells
+     * QEMU root also has: model, dma-coherent
+     */
+    nodeoff = fdt_path_offset(fdt, "/");
+    if (nodeoff >= 0) {
+        fdt_delprop(fdt, nodeoff, "dma-coherent");
+        fdt_delprop(fdt, nodeoff, "model");
+        error_report("GH: removed root model and dma-coherent");
+    }
+
+    /*
+     * Fix timer interrupt flags: CrosVM uses IRQ_TYPE_LEVEL_LOW (0x08),
+     * QEMU generates IRQ_TYPE_LEVEL_HI (0x04). RM may validate this.
+     *
+     * Timer interrupts format: (type, number, flags) x 4
+     * CrosVM: flags = IRQ_TYPE_LEVEL_LOW (0x08) for GICv3
+     */
+    nodeoff = fdt_path_offset(fdt, "/timer");
+    if (nodeoff >= 0) {
+        const fdt32_t *prop;
+        prop = fdt_getprop(fdt, nodeoff, "interrupts", &len);
+        if (prop && len >= 12 * (int)sizeof(fdt32_t)) {
+            /* 4 interrupts x 3 cells each = 12 cells */
+            fdt32_t new_irqs[12];
+            memcpy(new_irqs, prop, sizeof(new_irqs));
+            /* Fix flags (3rd cell of each triplet) to LEVEL_LOW */
+            new_irqs[2]  = cpu_to_fdt32(GIC_FDT_IRQ_FLAGS_LEVEL_LO);
+            new_irqs[5]  = cpu_to_fdt32(GIC_FDT_IRQ_FLAGS_LEVEL_LO);
+            new_irqs[8]  = cpu_to_fdt32(GIC_FDT_IRQ_FLAGS_LEVEL_LO);
+            new_irqs[11] = cpu_to_fdt32(GIC_FDT_IRQ_FLAGS_LEVEL_LO);
+            fdt_setprop(fdt, nodeoff, "interrupts", new_irqs,
+                        sizeof(new_irqs));
+            error_report("GH: fixed timer interrupts to LEVEL_LOW (0x%x)",
+                         GIC_FDT_IRQ_FLAGS_LEVEL_LO);
+        }
+
+        /*
+         * CrosVM timer compatible is just "arm,armv8-timer" (no armv7-timer).
+         */
+        fdt_setprop_string(fdt, nodeoff, "compatible", "arm,armv8-timer");
+    }
+
+    /*
+     * Fix GIC node: CrosVM sizes the REDIST region to match the actual
+     * vCPU count (0x20000 per CPU). QEMU's VIRT_GIC_REDIST is 0xF60000
+     * (space for 123 CPUs), which may cause RM to reject the VM.
+     * Also remove 'ranges' property (CrosVM doesn't set it without ITS).
+     *
+     * Rename the GIC node from "/intc@8000000" to "/intc" to match CrosVM.
+     * RM's overlay mechanism may look for "/intc" by path.
+     *
+     * Set phandle to 1 to match CrosVM's PHANDLE_GIC = 1.
+     */
+    {
+        char intc_path[64];
+        snprintf(intc_path, sizeof(intc_path), "/intc@%x", 0x8000000);
+        nodeoff = fdt_path_offset(fdt, intc_path);
+        if (nodeoff >= 0) {
+            /*
+             * GIC reg: DIST base, DIST size, REDIST base, REDIST size
+             * Fix REDIST size to 0x20000 * num_cpus (matching CrosVM).
+             */
+            uint32_t num_cpus = 1; /* TODO: get from machine->smp.cpus */
+            uint32_t redist_size = 0x20000 * num_cpus;
+            fdt32_t gic_reg[8];
+            gic_reg[0] = cpu_to_fdt32(0);          /* DIST base hi */
+            gic_reg[1] = cpu_to_fdt32(0x8000000);  /* DIST base lo */
+            gic_reg[2] = cpu_to_fdt32(0);          /* DIST size hi */
+            gic_reg[3] = cpu_to_fdt32(0x10000);    /* DIST size lo */
+            gic_reg[4] = cpu_to_fdt32(0);          /* REDIST base hi */
+            gic_reg[5] = cpu_to_fdt32(0x80a0000);  /* REDIST base lo */
+            gic_reg[6] = cpu_to_fdt32(0);          /* REDIST size hi */
+            gic_reg[7] = cpu_to_fdt32(redist_size);/* REDIST size lo */
+            fdt_setprop(fdt, nodeoff, "reg", gic_reg, sizeof(gic_reg));
+            fdt_delprop(fdt, nodeoff, "ranges");
+
+            /*
+             * Rename node from "intc@8000000" to "intc" (CrosVM naming).
+             * fdt_set_name changes the node name in-place.
+             */
+            fdt_set_name(fdt, nodeoff, "intc");
+
+            /*
+             * Set phandle to 1 (CrosVM's PHANDLE_GIC).
+             * We must also update the root interrupt-parent to match.
+             */
+            fdt_setprop_cell(fdt, nodeoff, "phandle", 1);
+
+            error_report("GH: fixed GIC: REDIST=0x%x (%u CPUs), "
+                         "renamed to /intc, phandle=1",
+                         redist_size, num_cpus);
+        }
+    }
+
+    /* Update root interrupt-parent to phandle 1 */
+    nodeoff = fdt_path_offset(fdt, "/");
+    if (nodeoff >= 0) {
+        fdt_setprop_cell(fdt, nodeoff, "interrupt-parent", 1);
+    }
+
+    /* Update gunyah-vm-config/interrupts config to phandle 1 */
+    nodeoff = fdt_path_offset(fdt, "/gunyah-vm-config/interrupts");
+    if (nodeoff >= 0) {
+        fdt_setprop_cell(fdt, nodeoff, "config", 1);
+    }
+
+    /*
+     * Fix CPU node: CrosVM uses compatible="arm,armv8" (not cortex-a57).
+     * Also remove cpu-map topology node (CrosVM doesn't create one).
+     */
+    nodeoff = fdt_path_offset(fdt, "/cpus/cpu@0");
+    if (nodeoff >= 0) {
+        fdt_setprop_string(fdt, nodeoff, "compatible", "arm,armv8");
+        error_report("GH: fixed cpu compatible to arm,armv8");
+    }
+
+    /* Remove cpu-map (CrosVM doesn't generate topology) */
+    nodeoff = fdt_path_offset(fdt, "/cpus/cpu-map");
+    if (nodeoff >= 0) {
+        fdt_nop_node(fdt, nodeoff);
+        error_report("GH: removed cpu-map");
+    }
+
+    /*
+     * Fix PSCI node: CrosVM uses only compatible="arm,psci-0.2" with
+     * method="hvc". No function ID properties (cpu_suspend, cpu_off, etc.)
+     */
+    nodeoff = fdt_path_offset(fdt, "/psci");
+    if (nodeoff >= 0) {
+        fdt_setprop_string(fdt, nodeoff, "compatible", "arm,psci-0.2");
+        fdt_delprop(fdt, nodeoff, "cpu_suspend");
+        fdt_delprop(fdt, nodeoff, "cpu_off");
+        fdt_delprop(fdt, nodeoff, "cpu_on");
+        fdt_delprop(fdt, nodeoff, "migrate");
+        error_report("GH: fixed PSCI to arm,psci-0.2 only");
+    }
+
+    /*
+     * Keep stdout-path in /chosen — PL011 UART is preserved for
+     * serial console output via MMIO exits.
+     * stdout-path="/pl011@9000000" → kernel uses ttyAMA0 as console.
+     *
+     * Note: the PL011 node was renamed (path changes from /pl011@9000000
+     * to just the node name), but stdout-path should still work since
+     * Linux resolves it via the full path or alias.
+     */
+
+    /*
+     * Add __symbols__ node - RM needs this for DTB overlay resolution.
+     * CrosVM creates __symbols__ { intc = "/intc"; }
+     * We renamed the GIC node to /intc above.
+     */
+    qemu_fdt_add_subnode(fdt, "/__symbols__");
+    qemu_fdt_setprop_string(fdt, "/__symbols__", "intc", "/intc");
+    error_report("GH: added __symbols__ node with intc -> /intc");
+}
+
+static void virt_modify_dtb(const struct arm_boot_info *binfo, void *fdt)
+{
+    const VirtMachineState *vms = container_of(binfo, VirtMachineState,
+                                                 bootinfo);
+    MachineState *ms = MACHINE(vms);
+    uint64_t mem_base = vms->memmap[VIRT_MEM].base;
+    uint64_t mem_size = ms->ram_size;
+    int ret;
+
+    /*
+     * Build a MINIMAL DTB from scratch, matching CrosVM's output format.
+     * This replaces ALL QEMU-generated content with exactly what
+     * Gunyah's Resource Manager (RM) expects.
+     *
+     * Serial output works through earlycon: the kernel's early console
+     * driver writes raw MMIO to the PL011 UART address (0x09000000).
+     * With base-address=0 in gunyah-vm-config, these accesses trigger
+     * GH_VCPU_EXIT_MMIO exits that QEMU handles via its PL011 model.
+     * A PL011 DTB node is included so the kernel probes ttyAMA0 for login.
+     */
+    error_report("GH: Building minimal DTB from scratch (mem_base=0x%"PRIx64
+                 " mem_size=0x%"PRIx64")", mem_base, mem_size);
+
+    /* Clear and create a new empty FDT */
+    ret = fdt_create_empty_tree(fdt, 0x100000 /* 1MB */);
+    if (ret) {
+        error_report("GH: fdt_create_empty_tree failed: %s",
+                     fdt_strerror(ret));
+        exit(1);
+    }
+
+    /* Root properties */
+    fdt_setprop_string(fdt, 0, "compatible", "linux,dummy-virt");
+    fdt_setprop_cell(fdt, 0, "interrupt-parent", 1);
+    fdt_setprop_cell(fdt, 0, "#address-cells", 2);
+    fdt_setprop_cell(fdt, 0, "#size-cells", 2);
+
+    /*
+     * /chosen — add earlycon bootargs for serial output via MMIO exits.
+     *
+     * PL011 earlycon writes to DR (offset 0x00) and reads UARTFR (offset
+     * 0x18) to check TX busy.  The MMIO exit handler forwards these to
+     * the PL011 device model.  console=ttyAMA0 enables the full PL011
+     * driver for login after earlycon hands off.
+     *
+     * Also preserve any user-specified bootargs from -append.
+     */
+    {
+        int chosen_off;
+        char bootargs[1024];
+        const char *user_cmdline = binfo->kernel_cmdline;
+        const char *earlycon_args =
+            "earlycon=pl011,mmio32,0x09000000 "
+            "console=ttyAMA0";
+
+        chosen_off = fdt_add_subnode(fdt, 0, "chosen");
+        if (user_cmdline && *user_cmdline) {
+            snprintf(bootargs, sizeof(bootargs),
+                     "%s %s", earlycon_args, user_cmdline);
+        } else {
+            snprintf(bootargs, sizeof(bootargs), "%s", earlycon_args);
+        }
+        fdt_setprop_string(fdt, chosen_off, "bootargs", bootargs);
+        error_report("GH: DTB /chosen/bootargs: %s", bootargs);
+    }
+
+    /*
+     * /config node — CrosVM creates this with kernel address and size.
+     * For firmware boot, the "kernel" is the firmware at flash base.
+     *
+     * For firmware boot: EDK2's MemoryInitPeim has PcdSystemMemoryBase
+     * baked in as 0x40000000 (QEMU virt default).  Our page tables map
+     * VA 0x40000000 → PA 0x80000000 (actual RAM GPA under Gunyah).
+     * The DTB /memory and /config must use 0x40000000 so the firmware's
+     * ASSERT(PcdSystemMemoryBase == NewBase) passes.  RM validates that
+     * kernel-address falls within /memory — both must be consistent.
+     *
+     * Memory size: 64 L2 block descriptors × 2MB = 128MB of VA space
+     * mapped at 0x40000000–0x47FFFFFF.  Report 128MB to avoid the
+     * firmware accessing unmapped VAs.
+     */
+    {
+        int cfg_off;
+        uint32_t cfg_addr, cfg_size;
+        uint64_t dtb_mem_base, dtb_mem_size;
+
+        if (binfo->firmware_loaded) {
+            /* Firmware boot: use firmware's expected VA for memory */
+            dtb_mem_base = 0x40000000ULL;
+            dtb_mem_size = 0x8000000ULL;  /* 128MB = 64 L2 blocks */
+        } else {
+            /* Kernel boot: use actual physical GPA */
+            dtb_mem_base = mem_base;
+            dtb_mem_size = mem_size;
+        }
+
+        cfg_off = fdt_add_subnode(fdt, 0, "config");
+        cfg_addr = (uint32_t)dtb_mem_base;
+        cfg_size = 0x1000000;
+        fdt_setprop_cell(fdt, cfg_off, "kernel-address", cfg_addr);
+        fdt_setprop_cell(fdt, cfg_off, "kernel-size", cfg_size);
+        error_report("GH: DTB /config: kernel-address=0x%x kernel-size=0x%x"
+                     "%s", cfg_addr, cfg_size,
+                     binfo->firmware_loaded ? " (firmware)" : "");
+    }
+
+    /* /memory */
+    {
+        int memoff;
+        fdt64_t mem_reg[2];
+        uint64_t dtb_mem_base, dtb_mem_size;
+
+        if (binfo->firmware_loaded) {
+            dtb_mem_base = 0x40000000ULL;
+            dtb_mem_size = 0x8000000ULL;  /* 128MB */
+        } else {
+            dtb_mem_base = mem_base;
+            dtb_mem_size = mem_size;
+        }
+
+        memoff = fdt_add_subnode(fdt, 0, "memory");
+        fdt_setprop_string(fdt, memoff, "device_type", "memory");
+        mem_reg[0] = cpu_to_fdt64(dtb_mem_base);
+        mem_reg[1] = cpu_to_fdt64(dtb_mem_size);
+        fdt_setprop(fdt, memoff, "reg", mem_reg, sizeof(mem_reg));
+        error_report("GH: DTB /memory: base=0x%"PRIx64" size=0x%"PRIx64
+                     "%s", dtb_mem_base, dtb_mem_size,
+                     binfo->firmware_loaded ? " (firmware VA)" : "");
+    }
+
+    /* /cpus and /cpus/cpu@N for each vCPU */
+    {
+        int cpus_off, cpu_off, i;
+        int num_cpus = ms->smp.cpus;
+        char cpuname[32];
+
+        cpus_off = fdt_add_subnode(fdt, 0, "cpus");
+        fdt_setprop_cell(fdt, cpus_off, "#address-cells", 1);
+        fdt_setprop_cell(fdt, cpus_off, "#size-cells", 0);
+
+        for (i = 0; i < num_cpus; i++) {
+            snprintf(cpuname, sizeof(cpuname), "cpu@%d", i);
+            cpu_off = fdt_add_subnode(fdt, cpus_off, cpuname);
+            fdt_setprop_string(fdt, cpu_off, "device_type", "cpu");
+            fdt_setprop_string(fdt, cpu_off, "compatible", "arm,armv8");
+            fdt_setprop_cell(fdt, cpu_off, "reg", i);
+            fdt_setprop_cell(fdt, cpu_off, "phandle", 0x100 + i);
+            if (num_cpus > 1) {
+                fdt_setprop_string(fdt, cpu_off, "enable-method", "psci");
+            }
+        }
+        error_report("GH: DTB /cpus: %d CPUs with%s PSCI",
+                     num_cpus, num_cpus > 1 ? "" : "out");
+    }
+
+    /* /intc — GICv3 at CrosVM addresses (proven to work with RM) */
+    {
+        int intc_off;
+        uint32_t redist_size = 0x20000 * ms->smp.cpus; /* 0x20000 per CPU */
+        fdt64_t gic_reg[4]; /* DIST base+size, REDIST base+size */
+
+        intc_off = fdt_add_subnode(fdt, 0, "intc");
+        fdt_setprop_string(fdt, intc_off, "compatible", "arm,gic-v3");
+        fdt_setprop_cell(fdt, intc_off, "#interrupt-cells", 3);
+        fdt_setprop(fdt, intc_off, "interrupt-controller", NULL, 0);
+        fdt_setprop_cell(fdt, intc_off, "#address-cells", 2);
+        fdt_setprop_cell(fdt, intc_off, "#size-cells", 2);
+
+        /*
+         * Use QEMU standard GIC addresses (0x08000000 / 0x080A0000).
+         * In Gunyah mode, the hypervisor virtualizes the GIC — the
+         * guest never directly accesses these addresses. RM reads them
+         * from the DTB to configure the VGIC.
+         *
+         * Previously used CrosVM addresses (0x3FFF0000 / 0x3FFD0000)
+         * but those overlap with PCI ECAM at 0x3f000000-0x3fffffff,
+         * causing "can't claim ECAM area: address conflict with GICR".
+         */
+        gic_reg[0] = cpu_to_fdt64(0x08000000);  /* DIST base */
+        gic_reg[1] = cpu_to_fdt64(0x10000);     /* DIST size */
+        gic_reg[2] = cpu_to_fdt64(0x080A0000);  /* REDIST base */
+        gic_reg[3] = cpu_to_fdt64(redist_size);  /* REDIST size */
+        fdt_setprop(fdt, intc_off, "reg", gic_reg, sizeof(gic_reg));
+        fdt_setprop_cell(fdt, intc_off, "phandle", 1);
+    }
+
+    /* /timer */
+    {
+        int timer_off;
+        fdt32_t timer_irqs[12] = {
+            cpu_to_fdt32(1), cpu_to_fdt32(13), cpu_to_fdt32(0x108),
+            cpu_to_fdt32(1), cpu_to_fdt32(14), cpu_to_fdt32(0x108),
+            cpu_to_fdt32(1), cpu_to_fdt32(11), cpu_to_fdt32(0x108),
+            cpu_to_fdt32(1), cpu_to_fdt32(10), cpu_to_fdt32(0x108),
+        };
+        timer_off = fdt_add_subnode(fdt, 0, "timer");
+        fdt_setprop_string(fdt, timer_off, "compatible", "arm,armv8-timer");
+        fdt_setprop(fdt, timer_off, "interrupts", timer_irqs,
+                    sizeof(timer_irqs));
+        fdt_setprop(fdt, timer_off, "always-on", NULL, 0);
+    }
+
+    /* /psci */
+    {
+        int psci_off;
+        psci_off = fdt_add_subnode(fdt, 0, "psci");
+        fdt_setprop_string(fdt, psci_off, "compatible", "arm,psci-0.2");
+        fdt_setprop_string(fdt, psci_off, "method", "hvc");
+    }
+
+    /* /reserved-memory — swiotlb restricted DMA pool for protected VMs */
+    {
+        GUNYAHState *gs = get_gunyah_state();
+        if (gs->protected_vm && gs->swiotlb_size) {
+            int resv_off, pool_off;
+            char poolname[64];
+            uint64_t resv_start = mem_base + mem_size - gs->swiotlb_size;
+            fdt64_t resv_reg[2];
+            const char compat[] = "restricted-dma-pool";
+
+            resv_off = fdt_add_subnode(fdt, 0, "reserved-memory");
+            fdt_setprop_cell(fdt, resv_off, "#address-cells", 2);
+            fdt_setprop_cell(fdt, resv_off, "#size-cells", 2);
+            fdt_setprop(fdt, resv_off, "ranges", NULL, 0);
+
+            snprintf(poolname, sizeof(poolname),
+                     "restricted_dma_reserved@%"PRIx64, resv_start);
+            pool_off = fdt_add_subnode(fdt, resv_off, poolname);
+            resv_reg[0] = cpu_to_fdt64(resv_start);
+            resv_reg[1] = cpu_to_fdt64(gs->swiotlb_size);
+            fdt_setprop(fdt, pool_off, "reg", resv_reg, sizeof(resv_reg));
+            fdt_setprop(fdt, pool_off, "compatible", compat, sizeof(compat));
+            {
+                fdt64_t alignment = cpu_to_fdt64(0x1000);
+                fdt_setprop(fdt, pool_off, "alignment", &alignment,
+                            sizeof(alignment));
+            }
+            fdt_setprop_cell(fdt, pool_off, "phandle", 2);
+
+            error_report("GH: DTB reserved-memory: restricted-dma-pool at "
+                         "0x%"PRIx64" size 0x%"PRIx64,
+                         resv_start, gs->swiotlb_size);
+        }
+    }
+
+    /*
+     * Virtio-MMIO transport nodes.
+     * QEMU virt machine creates 32 virtio-mmio transports at
+     * 0x0a000000 + i*0x200, IRQs SPI 16+i.  The guest kernel
+     * discovers them via these DTB nodes and probes each one.
+     * Only transports with attached devices will report non-zero
+     * DEVICE_ID.  memory-region links to the restricted-dma-pool
+     * so all DMA goes through SHARE'd memory (host-accessible).
+     */
+    {
+        GUNYAHState *gs = get_gunyah_state();
+        int i;
+        for (i = 0; i < 32; i++) {
+            int node_off;
+            char nodename[64];
+            uint64_t base = 0x0a000000 + i * 0x200;
+            int spi = 16 + i;
+            fdt64_t vmm_reg[2];
+            fdt32_t vmm_irq[3];
+
+            snprintf(nodename, sizeof(nodename),
+                     "virtio_mmio@%"PRIx64, base);
+            node_off = fdt_add_subnode(fdt, 0, nodename);
+
+            fdt_setprop_string(fdt, node_off, "compatible", "virtio,mmio");
+
+            vmm_reg[0] = cpu_to_fdt64(base);
+            vmm_reg[1] = cpu_to_fdt64(0x200);
+            fdt_setprop(fdt, node_off, "reg", vmm_reg, sizeof(vmm_reg));
+
+            vmm_irq[0] = cpu_to_fdt32(0);    /* SPI */
+            vmm_irq[1] = cpu_to_fdt32(spi);
+            vmm_irq[2] = cpu_to_fdt32(1);    /* EDGE_RISING */
+            fdt_setprop(fdt, node_off, "interrupts", vmm_irq, sizeof(vmm_irq));
+
+            fdt_setprop(fdt, node_off, "dma-coherent", NULL, 0);
+
+            /* Link to restricted-dma-pool (phandle 2) for SHARE'd DMA */
+            if (gs->protected_vm && gs->swiotlb_size) {
+                fdt_setprop_cell(fdt, node_off, "memory-region", 2);
+            }
+        }
+    }
+
+    /*
+     * PCI host bridge (GPEX) DTB node.
+     * QEMU's virt machine creates the GPEX device and maps its MMIO
+     * regions at these addresses.  Guest accesses below 1GiB trigger
+     * Gunyah MMIO exits, which QEMU dispatches to the GPEX controller.
+     * The kernel discovers PCI via this DTB node and enumerates devices.
+     *
+     * Addresses (all below 1GiB, trapped by Gunyah):
+     *   ECAM: 0x3f000000 (16MB — PCI config space)
+     *   MMIO: 0x10000000 (783MB — PCI MMIO window)
+     *   PIO:  0x3eff0000 (64KB — PCI I/O ports)
+     * IRQs: SPIs 3-6 (PCI INTx A-D), matching virt irqmap[VIRT_PCIE]=3
+     */
+    {
+        int pci_off;
+        uint64_t base_ecam = 0x3f000000;
+        uint64_t size_ecam = 0x01000000;
+        uint64_t base_mmio_pci = 0x10000000;
+        uint64_t size_mmio_pci = 0x2eff0000;
+        uint64_t base_pio = 0x3eff0000;
+        uint64_t size_pio = 0x00010000;
+        int first_irq = 3;
+        int nr_pcie_buses = size_ecam / (1 << 20); /* 16 buses */
+        GUNYAHState *gs_pci = get_gunyah_state();
+
+        pci_off = fdt_add_subnode(fdt, 0, "pcie@10000000");
+        fdt_setprop_string(fdt, pci_off, "compatible",
+                           "pci-host-ecam-generic");
+        fdt_setprop_string(fdt, pci_off, "device_type", "pci");
+        fdt_setprop_cell(fdt, pci_off, "#address-cells", 3);
+        fdt_setprop_cell(fdt, pci_off, "#size-cells", 2);
+        fdt_setprop_cell(fdt, pci_off, "linux,pci-domain", 0);
+        {
+            fdt32_t bus_range[2] = {
+                cpu_to_fdt32(0), cpu_to_fdt32(nr_pcie_buses - 1)
+            };
+            fdt_setprop(fdt, pci_off, "bus-range", bus_range,
+                        sizeof(bus_range));
+        }
+        fdt_setprop(fdt, pci_off, "dma-coherent", NULL, 0);
+
+        /* reg — ECAM base and size */
+        {
+            fdt64_t ecam_reg[2] = {
+                cpu_to_fdt64(base_ecam), cpu_to_fdt64(size_ecam)
+            };
+            fdt_setprop(fdt, pci_off, "reg", ecam_reg, sizeof(ecam_reg));
+        }
+
+        /* ranges — I/O port + MMIO, no highmem (Gunyah uses <1GiB) */
+        {
+            fdt32_t ranges[14]; /* 2 ranges × 7 cells each */
+            int idx = 0;
+
+            /* I/O Port: type=0x01000000 pci=0 cpu=base_pio size=size_pio */
+            ranges[idx++] = cpu_to_fdt32(0x01000000);
+            ranges[idx++] = cpu_to_fdt32(0);
+            ranges[idx++] = cpu_to_fdt32(0);
+            ranges[idx++] = cpu_to_fdt32(0);
+            ranges[idx++] = cpu_to_fdt32(base_pio);
+            ranges[idx++] = cpu_to_fdt32(0);
+            ranges[idx++] = cpu_to_fdt32(size_pio);
+
+            /* MMIO: type=0x02000000 pci=base cpu=base size=size */
+            ranges[idx++] = cpu_to_fdt32(0x02000000);
+            ranges[idx++] = cpu_to_fdt32(0);
+            ranges[idx++] = cpu_to_fdt32(base_mmio_pci);
+            ranges[idx++] = cpu_to_fdt32(0);
+            ranges[idx++] = cpu_to_fdt32(base_mmio_pci);
+            ranges[idx++] = cpu_to_fdt32(0);
+            ranges[idx++] = cpu_to_fdt32(size_mmio_pci);
+
+            fdt_setprop(fdt, pci_off, "ranges", ranges,
+                        idx * sizeof(fdt32_t));
+        }
+
+        /* interrupt-map: 4 slots × 4 pins = 16 entries */
+        fdt_setprop_cell(fdt, pci_off, "#interrupt-cells", 1);
+        {
+            fdt32_t irq_map[16 * 10];
+            int mi = 0, devfn, pin;
+
+            for (devfn = 0; devfn <= 0x18; devfn += 0x8) {
+                for (pin = 0; pin < 4; pin++) {
+                    int irq_nr = first_irq +
+                                 ((pin + (devfn >> 3)) % 4);
+                    irq_map[mi++] = cpu_to_fdt32(devfn << 8);
+                    irq_map[mi++] = cpu_to_fdt32(0);
+                    irq_map[mi++] = cpu_to_fdt32(0);
+                    irq_map[mi++] = cpu_to_fdt32(pin + 1);
+                    irq_map[mi++] = cpu_to_fdt32(1); /* gic phandle */
+                    irq_map[mi++] = cpu_to_fdt32(0);
+                    irq_map[mi++] = cpu_to_fdt32(0);
+                    irq_map[mi++] = cpu_to_fdt32(0); /* SPI type */
+                    irq_map[mi++] = cpu_to_fdt32(irq_nr);
+                    irq_map[mi++] = cpu_to_fdt32(4); /* LEVEL_HI */
+                }
+            }
+            fdt_setprop(fdt, pci_off, "interrupt-map", irq_map,
+                        mi * sizeof(fdt32_t));
+        }
+        {
+            fdt32_t irq_mask[4] = {
+                cpu_to_fdt32(0x1800), cpu_to_fdt32(0),
+                cpu_to_fdt32(0), cpu_to_fdt32(7)
+            };
+            fdt_setprop(fdt, pci_off, "interrupt-map-mask", irq_mask,
+                        sizeof(irq_mask));
+        }
+
+        /* Link to restricted-dma-pool so PCI DMA uses SHARE'd memory */
+        if (gs_pci->protected_vm && gs_pci->swiotlb_size) {
+            fdt_setprop_cell(fdt, pci_off, "memory-region", 2);
+        }
+
+        error_report("GH: DTB PCI host bridge: ECAM=0x%"PRIx64
+                     " MMIO=0x%"PRIx64"-0x%"PRIx64
+                     " PIO=0x%"PRIx64" IRQs SPI %d-%d",
+                     base_ecam, base_mmio_pci,
+                     base_mmio_pci + size_mmio_pci - 1,
+                     base_pio, first_irq, first_irq + 3);
+    }
+
+    /*
+     * /apb-pclk — fixed clock required by PL011 driver.
+     * Without this, the AMBA bus probe defers and ttyAMA0 never appears.
+     * phandle=3 (1=GIC, 2=restricted_dma_pool).
+     */
+    {
+        int clk_off = fdt_add_subnode(fdt, 0, "apb-pclk");
+        fdt_setprop_string(fdt, clk_off, "compatible", "fixed-clock");
+        fdt_setprop_cell(fdt, clk_off, "#clock-cells", 0);
+        fdt_setprop_cell(fdt, clk_off, "clock-frequency", 24000000);
+        fdt_setprop_string(fdt, clk_off, "clock-output-names", "clk24mhz");
+        fdt_setprop_cell(fdt, clk_off, "phandle", 3);
+        error_report("GH: DTB /apb-pclk: 24MHz fixed clock (phandle=3)");
+    }
+
+    /*
+     * /pl011@9000000 — PL011 UART for serial console login.
+     * The PL011 device model already exists at 0x09000000 (created by
+     * create_uart in the standard virt machine init).  This DTB node
+     * tells the kernel to probe the PL011 driver, creating /dev/ttyAMA0.
+     * IRQ: SPI 1, level-high — wired via bell-1 doorbell.
+     */
+    {
+        int uart_off = fdt_add_subnode(fdt, 0, "pl011@9000000");
+        const char compat[] = "arm,pl011\0arm,primecell";
+        const char clocknames[] = "uartclk\0apb_pclk";
+        fdt64_t uart_reg[2] = {
+            cpu_to_fdt64(0x09000000), cpu_to_fdt64(0x1000)
+        };
+        fdt32_t uart_irq[3] = {
+            cpu_to_fdt32(0),  /* GIC_SPI */
+            cpu_to_fdt32(1),  /* SPI number 1 */
+            cpu_to_fdt32(4)   /* IRQ_TYPE_LEVEL_HIGH */
+        };
+        fdt32_t uart_clocks[2] = {
+            cpu_to_fdt32(3), cpu_to_fdt32(3)  /* phandle 3 = apb-pclk */
+        };
+
+        fdt_setprop(fdt, uart_off, "compatible", compat, sizeof(compat));
+        fdt_setprop(fdt, uart_off, "reg", uart_reg, sizeof(uart_reg));
+        fdt_setprop(fdt, uart_off, "interrupts", uart_irq, sizeof(uart_irq));
+        fdt_setprop(fdt, uart_off, "clocks", uart_clocks, sizeof(uart_clocks));
+        fdt_setprop(fdt, uart_off, "clock-names",
+                    clocknames, sizeof(clocknames));
+        error_report("GH: DTB /pl011@9000000: ttyAMA0, SPI 1, level-high");
+    }
+
+    /*
+     * /gunyah-vm-config — SHM nodes, doorbells, base-address=0.
+     * base-address=0 is critical: it makes device addresses
+     * (UART at 0x09000000, GIC at 0x08000000) part of the VM's
+     * IPA layout so Gunyah generates MMIO exits for them.
+     */
+    gunyah_arm_fdt_customize(fdt, mem_base, 1 /* phandle=1 */);
+
+    /* /__symbols__ — RM needs this for DTB overlay resolution */
+    {
+        int sym_off;
+        sym_off = fdt_add_subnode(fdt, 0, "__symbols__");
+        fdt_setprop_string(fdt, sym_off, "intc", "/intc");
+    }
+
+    error_report("GH: Minimal DTB built with earlycon (totalsize=%u)",
+                 fdt_totalsize(fdt));
+}
+
 static void machvirt_init(MachineState *machine)
 {
     VirtMachineState *vms = VIRT_MACHINE(machine);
@@ -2121,6 +3050,30 @@ static void machvirt_init(MachineState *machine)
     unsigned int max_cpus = machine->smp.max_cpus;
 
     possible_cpus = mc->possible_cpu_arch_ids(machine);
+
+    /*
+     * Initialize confidential guest support (arm-confidential-guest object)
+     * before anything else.  This sets protected_vm=true and swiotlb_size
+     * on the Gunyah accelerator if the user specified:
+     *   -machine virt,confidential-guest-support=prot0
+     *   -object arm-confidential-guest,id=prot0,swiotlb-size=...
+     */
+    if (confidential_guest_init(machine) != 0) {
+        error_report("Failed to initialize confidential guest");
+        exit(1);
+    }
+
+    /*
+     * Gunyah only traps MMIO for the first 1 GiB of IPA space.
+     * PCI ECAM, PCI MMIO-high, and GIC redistributors must stay
+     * at their low addresses so guest accesses generate MMIO exits.
+     * Force all highmem placement off.
+     */
+    if (gunyah_enabled()) {
+        vms->highmem_ecam = false;
+        vms->highmem_mmio = false;
+        vms->highmem_redists = false;
+    }
 
     /*
      * In accelerated mode, the memory map is computed earlier in kvm_type()
@@ -2165,6 +3118,11 @@ static void machvirt_init(MachineState *machine)
         memory_region_add_subregion_overlap(secure_sysmem, 0, sysmem, -1);
     }
 
+    /*
+     * pflash must be realized even under Gunyah (or qdev asserts).
+     * virt_flash_map1() will realize but skip mapping to sysmem when
+     * Gunyah is enabled, avoiding the ROMD/MMIO toggle loop.
+     */
     firmware_loaded = virt_firmware_init(vms, sysmem,
                                          secure_sysmem ?: sysmem);
 
@@ -2363,7 +3321,10 @@ static void machvirt_init(MachineState *machine)
 
     virt_cpu_post_init(vms, sysmem);
 
-    fdt_add_pmu_nodes(vms);
+    /* CrosVM doesn't create PMU node for Gunyah VMs */
+    if (!gunyah_enabled()) {
+        fdt_add_pmu_nodes(vms);
+    }
 
     /*
      * The first UART always exists. If the security extensions are
@@ -2457,7 +3418,24 @@ static void machvirt_init(MachineState *machine)
     vms->bootinfo.skip_dtb_autoload = true;
     vms->bootinfo.firmware_loaded = firmware_loaded;
     vms->bootinfo.psci_conduit = vms->psci_conduit;
+    if (gunyah_enabled()) {
+        vms->bootinfo.modify_dtb = virt_modify_dtb;
+        fdt_add_reserved_memory(vms);
+    }
     arm_load_kernel(ARM_CPU(first_cpu), machine, &vms->bootinfo);
+
+    /*
+     * Tell Gunyah the actual kernel entry point (includes text_offset).
+     * arm_load_kernel() sets bootinfo.entry after loading/decompressing
+     * the kernel image.  The Gunyah boot stub needs this to jump to the
+     * correct address instead of guessing from memory slot start.
+     */
+    if (gunyah_enabled() && vms->bootinfo.entry) {
+        GUNYAHState *gs = get_gunyah_state();
+        gs->kernel_entry = vms->bootinfo.entry;
+        error_report("GH: kernel entry from arm_load_kernel: 0x%"PRIx64,
+                     gs->kernel_entry);
+    }
 
     vms->machine_done.notify = virt_machine_done;
     qemu_add_machine_init_done_notifier(&vms->machine_done);

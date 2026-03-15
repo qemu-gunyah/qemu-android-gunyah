@@ -661,6 +661,37 @@ int arm_load_dtb(hwaddr addr, const struct arm_boot_info *binfo,
         binfo->modify_dtb(binfo, fdt);
     }
 
+    /*
+     * Gunyah RM inspects and modifies device-tree (to provide additional
+     * information that VM may need). It depends on knowing total size reserved
+     * for device-tree (i.e FDT_MAX_SIZE) and current size (via @totalsize). At
+     * this point however, @totalsize = FDT_MAX_SIZE, making RM think that there
+     * is no room for modification and fail to start VM.
+     *
+     * Pack device-tree so that @totalsize reflects the actual size.
+     */
+    fdt_pack(fdt);
+
+    /*
+     * Dump packed DTB to file for debugging Gunyah RM validation.
+     * The file can be decompiled with: dtc -I dtb -O dts qemu_dtb.dtb
+     */
+    {
+        uint32_t packed_size = fdt_totalsize(fdt);
+        fprintf(stderr, "DTB: packed totalsize=%u (0x%x), addr=0x%"PRIx64
+                ", reserved_size=%d\n", packed_size, packed_size, (uint64_t)addr, size);
+
+        FILE *dtb_file = fopen("/data/local/tmp/qemu_dtb.dtb", "wb");
+        if (dtb_file) {
+            fwrite(fdt, 1, packed_size, dtb_file);
+            fclose(dtb_file);
+            fprintf(stderr, "DTB: dumped %u bytes to /data/local/tmp/qemu_dtb.dtb\n",
+                    packed_size);
+        } else {
+            fprintf(stderr, "DTB: failed to dump to file: %s\n", strerror(errno));
+        }
+    }
+
     /* Put the DTB into the memory map as a ROM image: this will ensure
      * the DTB is copied again upon reset, even if addr points into RAM.
      */

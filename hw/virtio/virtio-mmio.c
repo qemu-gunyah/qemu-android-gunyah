@@ -380,8 +380,16 @@ static void virtio_mmio_write(void *opaque, hwaddr offset, uint64_t value,
         if (value == 0) {
             virtio_mmio_soft_reset(proxy);
         } else {
-            virtio_queue_set_addr(vdev, vdev->queue_sel,
-                                  value << proxy->guest_page_shift);
+            hwaddr vring_gpa = (hwaddr)value << proxy->guest_page_shift;
+            error_report("GH-DBG: QUEUE_PFN write: queue_sel=%d pfn=0x%x "
+                         "page_shift=%d vring_gpa=0x%"HWADDR_PRIx
+                         " %s",
+                         vdev->queue_sel, (unsigned)value,
+                         proxy->guest_page_shift, vring_gpa,
+                         (vring_gpa >= 0xbc000000 && vring_gpa < 0xc0000000)
+                             ? "(SHARE'd region - OK)"
+                             : "(LEND'd region - WILL SIGBUS!)");
+            virtio_queue_set_addr(vdev, vdev->queue_sel, vring_gpa);
         }
         break;
     case VIRTIO_MMIO_QUEUE_READY:

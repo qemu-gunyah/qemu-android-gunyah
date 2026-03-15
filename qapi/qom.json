@@ -957,6 +957,21 @@
             '*kernel-hashes': 'bool' } }
 
 ##
+# @ArmConfidentialGuestProperties:
+#
+# Properties for arm-confidential-guest objects (Gunyah hypervisor).
+#
+# @swiotlb-size: size of the SHARE'd DMA bounce buffer region in
+#     bytes.  This memory is accessible by both host and guest for
+#     virtio DMA.  The rest of guest RAM is LEND'd (private).
+#     (default: 0)
+#
+# Since: 10.0
+##
+{ 'struct': 'ArmConfidentialGuestProperties',
+  'data': { '*swiotlb-size': 'uint64' } }
+
+##
 # @SevGuestProperties:
 #
 # Properties for sev-guest objects.
@@ -1131,6 +1146,7 @@
     'sev-guest',
     'sev-snp-guest',
     'thread-context',
+    'arm-confidential-guest',
     's390-pv-guest',
     'throttle-group',
     'tls-creds-anon',
@@ -1159,6 +1175,7 @@
   'data': {
       'acpi-generic-initiator':     'AcpiGenericInitiatorProperties',
       'acpi-generic-port':          'AcpiGenericPortProperties',
+      'arm-confidential-guest':     'ArmConfidentialGuestProperties',
       'authz-list':                 'AuthZListProperties',
       'authz-listfile':             'AuthZListFileProperties',
       'authz-pam':                  'AuthZPAMProperties',

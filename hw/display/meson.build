@@ -91,6 +91,16 @@ if config_all_devices.has_key('CONFIG_VIRTIO_GPU')
   endif
 endif
 
+if config_all_devices.has_key('CONFIG_FW_CFG_DMA')
+  virtio_ramfb_ss = ss.source_set()
+  virtio_ramfb_ss.add(when: 'CONFIG_FW_CFG_DMA', if_true: files('virtio-ramfb.c'))
+  hw_display_modules += {'virtio-ramfb': virtio_ramfb_ss}
+  virtio_ramfb_gl_ss = ss.source_set()
+  virtio_ramfb_gl_ss.add(when: ['CONFIG_FW_CFG_DMA', virgl, opengl],
+                       if_true: files('virtio-ramfb-gl.c'))
+  hw_display_modules += {'virtio-ramfb-gl': virtio_ramfb_gl_ss}
+endif
+
 if config_all_devices.has_key('CONFIG_VIRTIO_PCI')
   virtio_gpu_pci_ss = ss.source_set()
   virtio_gpu_pci_ss.add(when: ['CONFIG_VIRTIO_GPU', 'CONFIG_VIRTIO_PCI'],

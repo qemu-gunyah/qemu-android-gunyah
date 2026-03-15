@@ -26,6 +26,7 @@
 #include "qemu/units.h"
 #include "system/kvm.h"
 #include "system/hvf.h"
+#include "system/gunyah.h"
 #include "system/qtest.h"
 #include "system/tcg.h"
 #include "kvm_arm.h"
@@ -738,6 +739,17 @@ static void aarch64_a53_initfn(Object *obj)
 
 static void aarch64_host_initfn(Object *obj)
 {
+#if defined(CONFIG_GUNYAH)
+    if (gunyah_enabled()) {
+        /*
+         * Gunyah hypervisor passes through host CPU features transparently.
+         * Use cortex-a57 as a baseline; the hypervisor handles the actual
+         * CPU feature set at runtime.
+         */
+        aarch64_a57_initfn(obj);
+        return;
+    }
+#endif
 #if defined(CONFIG_KVM)
     ARMCPU *cpu = ARM_CPU(obj);
     kvm_arm_set_cpu_features_from_host(cpu);
@@ -756,8 +768,8 @@ static void aarch64_host_initfn(Object *obj)
 
 static void aarch64_max_initfn(Object *obj)
 {
-    if (kvm_enabled() || hvf_enabled()) {
-        /* With KVM or HVF, '-cpu max' is identical to '-cpu host' */
+    if (kvm_enabled() || hvf_enabled() || gunyah_enabled()) {
+        /* With KVM, HVF, or Gunyah, '-cpu max' is identical to '-cpu host' */
         aarch64_host_initfn(obj);
         return;
     }
@@ -776,7 +788,7 @@ static const ARMCPUInfo aarch64_cpus[] = {
     { .name = "cortex-a57",         .initfn = aarch64_a57_initfn },
     { .name = "cortex-a53",         .initfn = aarch64_a53_initfn },
     { .name = "max",                .initfn = aarch64_max_initfn },
-#if defined(CONFIG_KVM) || defined(CONFIG_HVF)
+#if defined(CONFIG_KVM) || defined(CONFIG_HVF) || defined(CONFIG_GUNYAH)
     { .name = "host",               .initfn = aarch64_host_initfn },
 #endif
 };

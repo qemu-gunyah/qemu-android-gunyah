@@ -32,6 +32,7 @@
 #include "qemu/module.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "system/gunyah.h"
 
 #define VIRTIO_GPU_VM_VERSION 1
 
@@ -837,9 +838,31 @@ int virtio_gpu_create_mapping_iov(VirtIOGPU *g,
 
         do {
             len = l;
-            map = dma_memory_map(VIRTIO_DEVICE(g)->dma_as, a, &len,
-                                 DMA_DIRECTION_TO_DEVICE,
-                                 MEMTXATTRS_UNSPECIFIED);
+
+            /*
+             * Gunyah protected VM: if the guest address falls in the
+             * LEND'd region, the host process cannot access it (SIGBUS).
+             * Allocate a local bounce buffer instead.  The display may
+             * show stale/blank content for these resources, but QEMU
+             * won't crash.  This typically happens when the guest GPU
+             * driver sends raw physical addresses instead of DMA-mapped
+             * (SHARE'd) addresses for its framebuffer backing pages.
+             */
+            if (gunyah_enabled() && gunyah_addr_is_lend(a)) {
+                static bool warned;
+                if (!warned) {
+                    error_report("GH: virtio-gpu: backing page GPA 0x%"
+                                 PRIx64 " is in LEND'd memory — using "
+                                 "local bounce buffer (display may be "
+                                 "blank)", a);
+                    warned = true;
+                }
+                map = g_malloc0(len);
+            } else {
+                map = dma_memory_map(VIRTIO_DEVICE(g)->dma_as, a, &len,
+                                     DMA_DIRECTION_TO_DEVICE,
+                                     MEMTXATTRS_UNSPECIFIED);
+            }
             if (!map) {
                 qemu_log_mask(LOG_GUEST_ERROR, "%s: failed to map MMIO memory for"
                               " element %d\n", __func__, e);
@@ -882,10 +905,23 @@ void virtio_gpu_cleanup_mapping_iov(VirtIOGPU *g,
     int i;
 
     for (i = 0; i < count; i++) {
-        dma_memory_unmap(VIRTIO_DEVICE(g)->dma_as,
-                         iov[i].iov_base, iov[i].iov_len,
-                         DMA_DIRECTION_TO_DEVICE,
-                         iov[i].iov_len);
+        /*
+         * Check if this IOV was mapped from a RAM MemoryRegion
+         * (dma_memory_map) or is a locally-allocated bounce buffer
+         * (g_malloc0, used for Gunyah LEND'd addresses).
+         * memory_region_from_host() returns NULL for the latter.
+         */
+        MemoryRegion *mr;
+        ram_addr_t offset;
+        mr = memory_region_from_host(iov[i].iov_base, &offset);
+        if (mr) {
+            dma_memory_unmap(VIRTIO_DEVICE(g)->dma_as,
+                             iov[i].iov_base, iov[i].iov_len,
+                             DMA_DIRECTION_TO_DEVICE,
+                             iov[i].iov_len);
+        } else {
+            g_free(iov[i].iov_base);
+        }
     }
     g_free(iov);
 }

@@ -34,6 +34,7 @@
 #include "hw/pci/msix.h"
 #include "hw/loader.h"
 #include "system/kvm.h"
+#include "system/gunyah.h"
 #include "hw/virtio/virtio-pci.h"
 #include "qemu/range.h"
 #include "hw/virtio/virtio-bus.h"
@@ -1943,6 +1944,36 @@ static void virtio_pci_pre_plugged(DeviceState *d, Error **errp)
 {
     VirtIOPCIProxy *proxy = VIRTIO_PCI(d);
     VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
+
+    /*
+     * Gunyah VMs: force modern-only mode + ACCESS_PLATFORM.
+     *
+     * In legacy virtio mode, vring buffers are allocated via
+     * __get_free_pages() which lands in LEND'd (host-inaccessible)
+     * memory, causing SIGBUS when QEMU tries to access the vring.
+     *
+     * Modern mode with VIRTIO_F_ACCESS_PLATFORM forces the guest kernel
+     * to use dma_alloc_coherent() for vring allocation, which routes
+     * through the restricted-dma-pool (SHARE'd, host-accessible memory).
+     * Data buffers are also bounce-buffered via swiotlb into the
+     * restricted pool, keeping all DMA addresses host-accessible.
+     */
+    if (gunyah_enabled()) {
+        proxy->disable_legacy = ON_OFF_AUTO_ON;
+        virtio_add_feature(&vdev->host_features, VIRTIO_F_IOMMU_PLATFORM);
+
+        /*
+         * Disable MSI-X: Gunyah has no ITS (GICv3 Interrupt Translation
+         * Service), so MSI-X interrupts have no delivery path.  Force
+         * devices to use INTx (PCI legacy interrupts), which are wired
+         * through doorbells to SPIs 3-6 in the guest GIC.
+         */
+        proxy->nvectors = 0;
+
+        error_report("GH: virtio-pci %s: forcing modern-only + "
+                     "ACCESS_PLATFORM + no-MSI-X (disable legacy)",
+                     vdev->name ? vdev->name : "?");
+    }
 
     if (virtio_pci_modern(proxy)) {
         virtio_add_feature(&vdev->host_features, VIRTIO_F_VERSION_1);
