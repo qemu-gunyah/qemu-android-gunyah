@@ -25,7 +25,6 @@ system_ss.add(files(
   'tpm-hmp-cmds.c',
   'vl.c',
   'watchpoint.c',
-  'android_entry.c',
 ), sdl, libpmem, libdaxctl)
 
 if have_tpm
