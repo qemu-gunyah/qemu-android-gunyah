@@ -28,6 +28,13 @@
 #include "system/replay.h"
 #include "system/system.h"
 
+#ifdef __linux__
+#include <sys/prctl.h>
+#ifndef PR_SET_THP_DISABLE
+#define PR_SET_THP_DISABLE 41
+#endif
+#endif
+
 #ifdef CONFIG_SDL
 /*
  * SDL insists on wrapping the main() function with its own implementation on
@@ -68,6 +75,20 @@ int (*qemu_main)(void) = os_darwin_cfrunloop_main;
 
 int main(int argc, char **argv)
 {
+    /*
+     * Disable THP (Transparent Huge Pages) for this process.
+     *
+     * Under Gunyah, guest RAM is LEND'd to the hypervisor and the host
+     * CPU loses access.  If any THPs were allocated, kswapd's
+     * deferred_split_scan will try to inspect those pages via the kernel
+     * direct map (memchr_inv), triggering a fatal synchronous external
+     * abort.  PR_SET_THP_DISABLE prevents the kernel from ever creating
+     * THPs in this process, regardless of the system-wide THP setting.
+     */
+#ifdef __linux__
+    prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+#endif
+
     qemu_init(argc, argv);
     bql_unlock();
     replay_mutex_unlock();

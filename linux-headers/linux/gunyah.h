@@ -261,6 +261,21 @@ enum gh_vcpu_exit {
 	GH_VCPU_EXIT_UNKNOWN,
 	GH_VCPU_EXIT_MMIO,
 	GH_VCPU_EXIT_STATUS,
+	GH_VCPU_EXIT_PAGE_FAULT,
+};
+
+/**
+ * enum gh_vcpu_resume_action - What to do when re-entering GH_VCPU_RUN
+ *                              after an MMIO or page fault exit.
+ * @GH_VCPU_RESUME_HANDLED: MMIO/fault was handled, continue normally.
+ * @GH_VCPU_RESUME_FAULT:   Could not handle; inject fault back to guest.
+ * @GH_VCPU_RESUME_RETRY:   Retry the faulting instruction (e.g. after
+ *                           adding a memory binding).
+ */
+enum gh_vcpu_resume_action {
+	GH_VCPU_RESUME_HANDLED = 0,
+	GH_VCPU_RESUME_FAULT,
+	GH_VCPU_RESUME_RETRY,
 };
 
 /**
@@ -298,12 +313,19 @@ struct gh_vcpu_run {
 			__u8  data[8];
 			__u32 len;
 			__u8  is_write;
+			__u8  resume_action;
 		} mmio;
 
 		struct {
 			enum gh_vm_status status;
 			struct gh_vm_exit_info exit_info;
 		} status;
+
+		struct {
+			__u64 phys_addr;
+			__s32 attempt;
+			__u8  resume_action;
+		} page_fault;
 	};
 };
 

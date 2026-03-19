@@ -396,6 +396,59 @@ static void gunyah_add_mem(GUNYAHState *s, MemoryRegionSection *section,
     ghdbg_hexdump(lend ? "LEND gh_userspace_memory_region"
                        : "SHARE gh_userspace_memory_region",
                   &gumr, sizeof(gumr));
+
+    /*
+     * Pre-fault all pages before LEND/SHARE ioctl.
+     *
+     * The kernel's gunyah_gup_share_parcel() uses pin_user_pages_fast()
+     * to pin pages during VM_START and bulk-LEND them to the hypervisor
+     * via the Resource Manager (efficient large-page mappings).
+     *
+     * Pages that aren't resident at that time miss the bulk LEND and
+     * must be demand-paged later via individual hypercalls
+     * (memextent_donate + addrspace_map), creating 4KB entries.
+     * The hypervisor has a limited page-table pool and runs out of
+     * memory (GUNYAH_ERROR_NOMEM) under heavy demand paging.
+     *
+     * By touching every page now (MADV_POPULATE_WRITE), we ensure
+     * all pages are physically resident when pin_user_pages runs,
+     * so the bulk LEND includes everything — no demand paging needed.
+     */
+    if (lend) {
+        void *region_base = (void *)(uintptr_t)gumr.userspace_addr;
+        uint64_t sz = gumr.memory_size;
+
+        error_report("GH: preparing LEND region: hva=0x%"PRIx64
+                     " size=0x%"PRIx64" (%"PRIu64" MB)",
+                     (uint64_t)gumr.userspace_addr, sz, sz >> 20);
+
+        /*
+         * Pre-populate all pages so pin_user_pages_fast() in the LEND
+         * ioctl finds them resident.  This enables bulk LEND with
+         * efficient 2MB/1GB stage-2 block mappings in the hypervisor.
+         *
+         * Without this, unpopulated pages fall back to runtime demand
+         * paging (individual 4KB mappings), which exhausts the
+         * hypervisor's page table pool (ENOMEM).
+         *
+         * Note: we deliberately allow THPs here — the hypervisor
+         * benefits from physically contiguous pages for large block
+         * mappings.  The kswapd/deferred_split_scan crash on LEND'd
+         * THPs is handled by the gh_disable_deferred_split.ko module.
+         */
+#ifdef MADV_POPULATE_WRITE
+        error_report("GH: populating LEND region (%"PRIu64" MB) ...",
+                     sz >> 20);
+        ret = madvise(region_base, sz, MADV_POPULATE_WRITE);
+        error_report("GH: MADV_POPULATE_WRITE: %s",
+                     ret == 0 ? "OK" : strerror(errno));
+#endif
+        /* Lock pages so they stay resident until LEND pins them */
+        ret = mlock(region_base, sz);
+        error_report("GH: mlock: %s",
+                     ret == 0 ? "OK" : strerror(errno));
+    }
+
     if (lend) {
         ret = gunyah_vm_ioctl(GH_VM_ANDROID_LEND_USER_MEM, &gumr);
     } else {
@@ -1362,6 +1415,35 @@ vm_start:
     }
     error_report("GH: VM_START OK");
 
+    /*
+     * After VM_START, the LEND'd physical pages belong to the hypervisor.
+     * The host CPU can no longer access them — any read/write triggers a
+     * synchronous external abort.
+     *
+     * Problem: kswapd's deferred_split_scan() still has references to these
+     * pages and will try to inspect them (memchr_inv), causing a kernel panic:
+     *   Internal error: synchronous external abort: 0000000096000010
+     *   pc: memchr_inv+0x114/0x270
+     *   lr: deferred_split_scan+0x358/0x628
+     *
+     * Fix: MADV_DONTNEED drops the page table entries and releases the pages
+     * from the kernel's tracking structures (LRU lists, deferred_split_queue).
+     * Then mprotect(PROT_NONE) prevents any future faults from re-establishing
+     * mappings to those pages.
+     */
+    for (i = 0; i < s->nr_slots; i++) {
+        gunyah_slot *slot = &s->slots[i];
+        if (slot->size && slot->lend && slot->mem) {
+            void *base = slot->mem;
+            size_t sz = slot->size;
+
+            /* Unlock pages now that LEND has pinned them */
+            munlock(base, sz);
+            error_report("GH: LEND region hva=%p size=0x%zx post-start "
+                         "munlock done", base, sz);
+        }
+    }
+
     qatomic_set(&s->vm_started, 1);
 }
 
@@ -1573,121 +1655,134 @@ static int gunyah_vcpu_exec(CPUState *cpu)
             }
             break;
 
+        case GH_VCPU_EXIT_PAGE_FAULT:
+            /*
+             * PAGE_FAULT exit: the kernel's demand paging couldn't
+             * resolve a stage-2 fault and forwarded it to userspace.
+             *
+             * The kernel populates run->page_fault with:
+             *   .phys_addr    - faulting guest physical address
+             *   .attempt      - error code from gunyah_demand_page()
+             *                   (e.g. -ENOENT, -EPERM, -EIO, etc.)
+             *   .resume_action - initially GUNYAH_VCPU_RESUME_FAULT
+             *
+             * We can set resume_action to tell the kernel what to do
+             * on the next GH_VCPU_RUN:
+             *   RESUME_RETRY  - retry the faulting instruction
+             *   RESUME_FAULT  - inject data abort into guest
+             */
+            {
+                uint64_t fault_addr = run->page_fault.phys_addr;
+                int32_t attempt = run->page_fault.attempt;
+                AccelCPUState *acpu = cpu->accel;
+
+                if (fault_addr == acpu->last_fault_addr) {
+                    acpu->same_fault_count++;
+                } else {
+                    acpu->last_fault_addr = fault_addr;
+                    acpu->same_fault_count = 1;
+                }
+
+                if (acpu->same_fault_count == 1) {
+                    static int page_fault_log_count;
+                    if (page_fault_log_count < 100) {
+                        error_report("GH: CPU#%d PAGE_FAULT at "
+                            "0x%"PRIx64" attempt=%d (%s) lend=%d",
+                            cpu->cpu_index, fault_addr, attempt,
+                            attempt == -2 ? "ENOENT" :
+                            attempt == -1 ? "EPERM" :
+                            attempt == -5 ? "EIO" :
+                            attempt == -12 ? "ENOMEM" :
+                            attempt == -95 ? "EOPNOTSUPP" : "other",
+                            gunyah_addr_is_lend(fault_addr));
+                        page_fault_log_count++;
+                    }
+                }
+
+                if (qatomic_read(&cpu->exit_request) ||
+                    qatomic_read(&gunyah_vm_stopped)) {
+                    ret = EXCP_INTERRUPT;
+                    break;
+                }
+
+                /*
+                 * All PAGE_FAULT errors are treated the same way:
+                 *
+                 * Retry a few times (the fault might be transient —
+                 * e.g. racing with another vCPU, or memory pressure).
+                 * After 10 retries, inject the fault into the guest
+                 * and suppress further logging for this address.
+                 *
+                 * For ENOMEM from addrspace_map (GUNYAH_ERROR_NOMEM=10),
+                 * the hypervisor's stage-2 page table pool is exhausted.
+                 * This is PERMANENT — retrying thousands of times is
+                 * useless and only causes soft lockups.
+                 *
+                 * After injection, the guest kernel receives a
+                 * synchronous data abort (SIGBUS to the faulting
+                 * process, or guest kernel handles it).
+                 *
+                 * We also add this address to a "permanently failed"
+                 * set so we don't spam logs or waste time on it if
+                 * the guest retries the access.
+                 */
+                if (acpu->same_fault_count <= 10) {
+                    /* Retry: fault may be transient */
+                    run->page_fault.resume_action = GH_VCPU_RESUME_RETRY;
+                    if (acpu->same_fault_count > 3) {
+                        usleep(1000); /* 1ms after 3 fast retries */
+                    }
+                    ret = 0;
+                } else {
+                    /*
+                     * Permanent failure — inject fault into guest.
+                     * Use RESUME_FAULT so the hypervisor delivers a
+                     * synchronous external abort to the guest.
+                     */
+                    if (acpu->same_fault_count == 11) {
+                        error_report("GH: CPU#%d PAGE_FAULT at 0x%"PRIx64
+                            " PERMANENT (attempt=%d) after %d retries"
+                            " — injecting abort into guest",
+                            cpu->cpu_index, fault_addr, attempt,
+                            acpu->same_fault_count);
+                    }
+                    run->page_fault.resume_action = GH_VCPU_RESUME_FAULT;
+                    /*
+                     * Sleep 50ms to give guest exception handler
+                     * time to run (handle the abort, SIGBUS the
+                     * faulting process) before we re-enter.
+                     * Without this, the guest immediately re-faults
+                     * before its handler can run.
+                     */
+                    usleep(50000);
+                    ret = 0;
+                }
+            }
+            break;
+
         default:
             /*
-             * Unknown exit reason — could be:
-             *  - exit_reason=3: Android Gunyah stage-2 page fault
-             *    (instruction abort or data abort forwarded to userspace)
-             *  - Other platform-specific exit types
+             * Unknown/extended exit reason.
              *
-             * The run struct may carry an MMIO-style payload if the
-             * kernel filled it (len > 0), or just a faulting address
-             * if it's a pure page fault (len = 0).
+             * For non-LEND addresses with a valid MMIO payload
+             * (len 1-8), dispatch normally via address_space_rw.
+             * For LEND'd addresses or unknown exits, retry briefly
+             * then give up.
              */
             {
                 uint64_t unk_addr = run->mmio.phys_addr;
                 AccelCPUState *acpu = cpu->accel;
 
-                if (run->mmio.len > 0 && run->mmio.len <= 8) {
-                    /* Has MMIO-style payload — forward to address space */
-
-                    /*
-                     * Fast path for addresses in LEND'd memory:
-                     * these are guest stage-2 faults on pages the
-                     * host can't access anyway.  Return 0 for reads,
-                     * ignore writes, without taking BQL.
-                     *
-                     * Use per-CPU repeat tracking with progressive
-                     * backoff to prevent soft lockups when the guest
-                     * generates thousands of these faults (e.g. GPU
-                     * driver probing LEND'd framebuffer pages).
-                     */
-                    if (gunyah_addr_is_lend(unk_addr)) {
-                        /*
-                         * LEND'd memory is host-inaccessible.  Return
-                         * zeros for reads and drop writes so the vCPU
-                         * can make progress.
-                         *
-                         * Tiered backoff to balance speed vs lockups:
-                         *  - First 20 faults at same addr: no sleep
-                         *    (handles quick DMA bursts at full speed)
-                         *  - 20-200: usleep(100) — 0.1ms, lets guest
-                         *    timer interrupts fire to prevent lockup
-                         *  - 200+: usleep(1000) — 1ms, persistent
-                         *    loop; keeps CPU usage reasonable
-                         *
-                         * Compared to the old 100ms sleep this is
-                         * 100-1000x faster, avoiding the multi-second
-                         * stalls that froze Firefox/heavy apps.
-                         */
-                        if (!run->mmio.is_write) {
-                            memset(run->mmio.data, 0, run->mmio.len);
-                        }
-
-                        if (unk_addr == acpu->last_fault_addr) {
-                            acpu->same_fault_count++;
-                        } else {
-                            acpu->last_fault_addr = unk_addr;
-                            acpu->same_fault_count = 1;
-                        }
-
-                        if (acpu->same_fault_count > 200) {
-                            usleep(1000);   /* 1ms — persistent loop */
-                        } else if (acpu->same_fault_count > 20) {
-                            usleep(100);    /* 0.1ms — moderate */
-                        }
-                        /* else: no sleep for first 20 */
-
-                        /* Check exit request periodically */
-                        if (acpu->same_fault_count > 20 &&
-                            (qatomic_read(&cpu->exit_request) ||
-                             qatomic_read(&gunyah_vm_stopped))) {
-                            ret = EXCP_INTERRUPT;
-                            break;
-                        }
-
-                        static int lend_mmio_log;
-                        if (lend_mmio_log < 5 ||
-                            (acpu->same_fault_count == 1 &&
-                             lend_mmio_log < 20)) {
-                            error_report("GH: CPU#%d LEND MMIO: "
-                                "addr=0x%"PRIx64" len=%u is_write=%d"
-                                " (repeat=%d)",
-                                cpu->cpu_index, unk_addr,
-                                run->mmio.len, run->mmio.is_write,
-                                acpu->same_fault_count);
-                            lend_mmio_log++;
-                        }
-                    } else {
-                        bql_lock();
-                        address_space_rw(&address_space_memory,
-                            unk_addr, MEMTXATTRS_UNSPECIFIED,
-                            run->mmio.data, run->mmio.len,
-                            run->mmio.is_write);
-                        bql_unlock();
-                    }
-                    ret = 0; /* continue running */
+                if (!gunyah_addr_is_lend(unk_addr) &&
+                    run->mmio.len > 0 && run->mmio.len <= 8) {
+                    bql_lock();
+                    address_space_rw(&address_space_memory,
+                        unk_addr, MEMTXATTRS_UNSPECIFIED,
+                        run->mmio.data, run->mmio.len,
+                        run->mmio.is_write);
+                    bql_unlock();
+                    ret = 0;
                 } else {
-                    /*
-                     * len=0: pure page fault / instruction abort.
-                     *
-                     * The kernel may have already resolved the stage-2
-                     * fault (demand-paged the SHARE'd/LEND'd memory).
-                     * Re-enter the vCPU and let the guest retry the
-                     * faulting access.
-                     *
-                     * For LEND'd memory addresses, faults are expected
-                     * as Gunyah demand-pages guest RAM.  Yield the CPU
-                     * to let the kernel driver resolve the mapping and
-                     * never abort (the kernel will eventually map it).
-                     *
-                     * For non-LEND addresses, bail out after many
-                     * identical faults (truly unresolvable).
-                     *
-                     * Per-CPU tracking avoids cross-thread interference
-                     * (the old static vars were shared across all 8
-                     * vCPU threads, causing false aborts).
-                     */
                     if (unk_addr == acpu->last_fault_addr) {
                         acpu->same_fault_count++;
                     } else {
@@ -1695,34 +1790,7 @@ static int gunyah_vcpu_exec(CPUState *cpu)
                         acpu->same_fault_count = 1;
                     }
 
-                    if (gunyah_addr_is_lend(unk_addr)) {
-                        /*
-                         * LEND'd memory: demand-paging fault.
-                         * Sleep to let the kernel driver resolve the
-                         * stage-2 mapping, then retry.
-                         */
-                        if (acpu->same_fault_count == 1) {
-                            static int lend_fault_log_count;
-                            if (lend_fault_log_count < 50) {
-                                error_report("GH: CPU#%d len=0 fault "
-                                    "at LEND'd addr 0x%"PRIx64
-                                    " (demand-page, retrying)",
-                                    cpu->cpu_index, unk_addr);
-                                lend_fault_log_count++;
-                            }
-                        }
-                        if (qatomic_read(&cpu->exit_request) ||
-                            qatomic_read(&gunyah_vm_stopped)) {
-                            ret = EXCP_INTERRUPT;
-                            break;
-                        }
-                        if (acpu->same_fault_count > 3) {
-                            usleep(100000); /* 100ms — persistent */
-                        } else {
-                            usleep(10000);  /* 10ms — first few */
-                        }
-                        ret = 0; /* always retry for LEND'd memory */
-                    } else if (acpu->same_fault_count > 500) {
+                    if (acpu->same_fault_count > 500) {
                         error_report("GH: CPU#%d exit_reason=%d stuck "
                                      "at addr=0x%"PRIx64" (%d repeats)"
                                      " — unresolvable fault, aborting",
@@ -1733,7 +1801,7 @@ static int gunyah_vcpu_exec(CPUState *cpu)
                         if (acpu->same_fault_count > 10) {
                             usleep(100);
                         }
-                        ret = 0; /* retry — kernel may resolve it */
+                        ret = 0;
                     }
                 }
             }

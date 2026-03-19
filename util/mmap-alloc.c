@@ -291,6 +291,22 @@ void *qemu_ram_mmap(int fd,
         munmap(ptr + size + guard_pagesize, total - size - guard_pagesize);
     }
 
+    /*
+     * Disable THP for this region on Android/Linux.
+     *
+     * When running under Gunyah, guest RAM is LEND'd to the hypervisor.
+     * If the kernel allocated THPs (transparent huge pages), kswapd's
+     * deferred_split_scan will later try to inspect those pages via the
+     * direct map (memchr_inv), triggering a synchronous external abort
+     * on LEND'd memory — an unrecoverable kernel panic.
+     *
+     * Setting MADV_NOHUGEPAGE immediately after mmap ensures the kernel
+     * never allocates THPs for guest RAM, preventing the crash.
+     */
+#ifdef MADV_NOHUGEPAGE
+    madvise(ptr, size, MADV_NOHUGEPAGE);
+#endif
+
     return ptr;
 }
 
