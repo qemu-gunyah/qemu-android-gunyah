@@ -32,7 +32,7 @@ typedef struct gunyah_slot {
     bool lend;
 } gunyah_slot;
 
-#define GUNYAH_MAX_MEM_SLOTS    32
+#define GUNYAH_MAX_MEM_SLOTS    128
 
 struct GUNYAHState {
     AccelState parent_obj;
@@ -43,6 +43,7 @@ struct GUNYAHState {
     int fd;
     int vmfd;
     uint64_t swiotlb_size;
+    uint64_t thp_trimmed;   /* Bytes trimmed from LEND region for THP coverage */
     bool preshmem_reserved;
     uint32_t preshmem_size;
     uint32_t nr_irqs;

@@ -1375,8 +1375,29 @@ static bool virt_firmware_init(VirtMachineState *vms,
             error_report("Could not find ROM image '%s'", bios_name);
             exit(1);
         }
-        mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(vms->flash[0]), 0);
-        image_size = load_image_mr(fname, mr);
+
+        if (gunyah_enabled()) {
+            /*
+             * Gunyah: load firmware directly into RAM at VIRT_MEM.base.
+             *
+             * Pflash at GPA 0x0 is SHARE'd (not executable in protected
+             * VMs). Instead, load the FD into LEND'd RAM so it can be
+             * executed directly. The EDK2 FD is compiled with
+             * PcdFdBaseAddress=0x80000000 to match this load address.
+             */
+            hwaddr fw_base = vms->memmap[VIRT_MEM].base;
+            image_size = load_image_targphys(fname, fw_base,
+                                             vms->memmap[VIRT_MEM].size);
+            if (image_size > 0) {
+                error_report("Gunyah: loaded firmware '%s' (%d bytes) "
+                             "at GPA 0x%"PRIx64, bios_name, image_size,
+                             (uint64_t)fw_base);
+            }
+        } else {
+            mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(vms->flash[0]), 0);
+            image_size = load_image_mr(fname, mr);
+        }
+
         g_free(fname);
         if (image_size < 0) {
             error_report("Could not load ROM image '%s'", bios_name);
@@ -1796,18 +1817,17 @@ void virt_machine_done(Notifier *notifier, void *data)
 
     if (gunyah_enabled()) {
         /*
-         * CrosVM places the DTB at the end of main_memory_size, which
-         * EXCLUDES swiotlb. This is critical: the DTB must be in the
-         * LEND region, not the SHARE region.
+         * DTB placement for Gunyah guests.
          *
-         * CrosVM: memory_end = PHYS_MEM_START + (total - swiotlb)
-         *         fdt_address = memory_end - FDT_MAX_SIZE
+         * The DTB must be in a LEND region (RM rejects SHARE'd config
+         * images with NORESOURCE).
          *
-         * The config image parcel is created from the binding containing
-         * the DTB GPA. If DTB is in the LEND binding, the parcel uses
-         * MEM_LEND (1 ACL entry). If DTB is in the SHARE binding, it
-         * uses MEM_SHARE (2 ACL entries). RM rejects VM_INIT with
-         * NORESOURCE if the config image is SHARED instead of LENT.
+         * For firmware boot: place DTB at mem_base + 0x400000 (4MB offset)
+         * to match EDK2's PcdDeviceTreeInitialBaseAddress. This avoids
+         * overlapping the 3MB FD loaded at mem_base, and the stack at
+         * mem_base + 0x380000.
+         *
+         * For kernel boot: place at end of LEND region (matches CrosVM).
          */
         GUNYAHState *gs = GUNYAH_STATE(current_accel());
         uint64_t gunyah_dtb_size = 0x200000; /* 2MB, matches CrosVM */
@@ -1815,16 +1835,23 @@ void virt_machine_done(Notifier *notifier, void *data)
         if (gs->protected_vm && gs->swiotlb_size) {
             main_mem_size -= gs->swiotlb_size;
         }
-        uint64_t mem_end = info->loader_start + main_mem_size;
-
-        info->dtb_start = QEMU_ALIGN_DOWN(mem_end - gunyah_dtb_size,
-                                           gunyah_dtb_size);
+        if (info->firmware_loaded) {
+            /* Firmware: DTB at fixed offset matching PcdDeviceTreeInitialBaseAddress */
+            info->dtb_start = info->loader_start + 0x400000;
+        } else {
+            /* Kernel: DTB at end of LEND region (CrosVM convention) */
+            uint64_t mem_end = info->loader_start + main_mem_size;
+            info->dtb_start = QEMU_ALIGN_DOWN(mem_end - gunyah_dtb_size,
+                                               gunyah_dtb_size);
+        }
         info->dtb_limit = 0; /* no limit */
-        error_report("GH: DTB placed at end of LEND region (matches CrosVM): "
-                     "dtb_start=0x%"PRIx64" dtb_size=0x%"PRIx64
-                     " main_mem=0x%"PRIx64" swiotlb=0x%"PRIx64,
+        error_report("GH: DTB placed at dtb_start=0x%"PRIx64
+                     " dtb_size=0x%"PRIx64
+                     " main_mem=0x%"PRIx64" swiotlb=0x%"PRIx64
+                     " firmware=%d",
                      (uint64_t)info->dtb_start, gunyah_dtb_size,
-                     main_mem_size, gs->swiotlb_size);
+                     main_mem_size, gs->swiotlb_size,
+                     info->firmware_loaded);
     }
 
     if (arm_load_dtb(info->dtb_start, info, info->dtb_limit, as, ms, cpu) < 0) {
@@ -2359,7 +2386,7 @@ static void virt_strip_dtb_for_gunyah(void *fdt, uint32_t gic_phandle)
      * Keep: /, memory, cpus, intc, timer, psci, chosen, gunyah-vm-config
      */
     static const char * const nodes_to_remove[] = {
-        "/platform-bus@c000000",
+        /* Keep /platform-bus@c000000 — uefi-vars-sysbus lives here */
         "/fw-cfg@9020000",
         "/gpio-keys",
         "/pl061@9030000",
@@ -2622,36 +2649,18 @@ static void virt_modify_dtb(const struct arm_boot_info *binfo, void *fdt)
 
     /*
      * /config node — CrosVM creates this with kernel address and size.
-     * For firmware boot, the "kernel" is the firmware at flash base.
+     * For firmware boot, the "kernel" is the firmware at RAM base.
      *
-     * For firmware boot: EDK2's MemoryInitPeim has PcdSystemMemoryBase
-     * baked in as 0x40000000 (QEMU virt default).  Our page tables map
-     * VA 0x40000000 → PA 0x80000000 (actual RAM GPA under Gunyah).
-     * The DTB /memory and /config must use 0x40000000 so the firmware's
-     * ASSERT(PcdSystemMemoryBase == NewBase) passes.  RM validates that
-     * kernel-address falls within /memory — both must be consistent.
-     *
-     * Memory size: 64 L2 block descriptors × 2MB = 128MB of VA space
-     * mapped at 0x40000000–0x47FFFFFF.  Report 128MB to avoid the
-     * firmware accessing unmapped VAs.
+     * EDK2 is recompiled with PcdSystemMemoryBase=0x80000000 (matching
+     * Gunyah's RAM placement). DTB /memory and /config use the actual
+     * physical GPA so EDK2's ASSERT(PcdSystemMemoryBase == NewBase) passes.
      */
     {
         int cfg_off;
         uint32_t cfg_addr, cfg_size;
-        uint64_t dtb_mem_base, dtb_mem_size;
-
-        if (binfo->firmware_loaded) {
-            /* Firmware boot: use firmware's expected VA for memory */
-            dtb_mem_base = 0x40000000ULL;
-            dtb_mem_size = 0x8000000ULL;  /* 128MB = 64 L2 blocks */
-        } else {
-            /* Kernel boot: use actual physical GPA */
-            dtb_mem_base = mem_base;
-            dtb_mem_size = mem_size;
-        }
 
         cfg_off = fdt_add_subnode(fdt, 0, "config");
-        cfg_addr = (uint32_t)dtb_mem_base;
+        cfg_addr = (uint32_t)mem_base;
         cfg_size = 0x1000000;
         fdt_setprop_cell(fdt, cfg_off, "kernel-address", cfg_addr);
         fdt_setprop_cell(fdt, cfg_off, "kernel-size", cfg_size);
@@ -2660,28 +2669,33 @@ static void virt_modify_dtb(const struct arm_boot_info *binfo, void *fdt)
                      binfo->firmware_loaded ? " (firmware)" : "");
     }
 
-    /* /memory */
+    /*
+     * /memory — report only the LEND'd region size.
+     * Gunyah RM validates DTB /memory against the LEND'd memory slot,
+     * NOT the total VM memory.  The SHARE'd region (swiotlb) is
+     * configured separately via gunyah-vm-config SHM and must NOT be
+     * included in DTB /memory.  Including it causes RM to crash.
+     */
     {
         int memoff;
         fdt64_t mem_reg[2];
-        uint64_t dtb_mem_base, dtb_mem_size;
+        GUNYAHState *gs_mem = get_gunyah_state();
+        uint64_t dtb_mem_size = mem_size;
 
-        if (binfo->firmware_loaded) {
-            dtb_mem_base = 0x40000000ULL;
-            dtb_mem_size = 0x8000000ULL;  /* 128MB */
-        } else {
-            dtb_mem_base = mem_base;
-            dtb_mem_size = mem_size;
+        if (gs_mem->protected_vm && gs_mem->swiotlb_size) {
+            dtb_mem_size = mem_size - gs_mem->swiotlb_size;
         }
-
         memoff = fdt_add_subnode(fdt, 0, "memory");
         fdt_setprop_string(fdt, memoff, "device_type", "memory");
-        mem_reg[0] = cpu_to_fdt64(dtb_mem_base);
+        mem_reg[0] = cpu_to_fdt64(mem_base);
         mem_reg[1] = cpu_to_fdt64(dtb_mem_size);
         fdt_setprop(fdt, memoff, "reg", mem_reg, sizeof(mem_reg));
         error_report("GH: DTB /memory: base=0x%"PRIx64" size=0x%"PRIx64
-                     "%s", dtb_mem_base, dtb_mem_size,
-                     binfo->firmware_loaded ? " (firmware VA)" : "");
+                     " (total=0x%"PRIx64" lend_only=%d)"
+                     "%s", mem_base, dtb_mem_size,
+                     mem_size,
+                     (gs_mem->protected_vm && gs_mem->swiotlb_size) ? 1 : 0,
+                     binfo->firmware_loaded ? " (firmware)" : "");
     }
 
     /* /cpus and /cpus/cpu@N for each vCPU */
@@ -3020,6 +3034,35 @@ static void virt_modify_dtb(const struct arm_boot_info *binfo, void *fdt)
      * IPA layout so Gunyah generates MMIO exits for them.
      */
     gunyah_arm_fdt_customize(fdt, mem_base, 1 /* phandle=1 */);
+
+    /*
+     * Platform-bus + dynamic sysbus devices (e.g. uefi-vars-sysbus).
+     *
+     * The normal code path adds these in virt_machine_done() before
+     * arm_load_dtb(), but virt_modify_dtb() wipes the FDT with
+     * fdt_create_empty_tree().  So we must add them here, after
+     * rebuilding the minimal DTB.
+     *
+     * platform_bus_add_all_fdt_nodes() creates the /platform-bus@c000000
+     * node and iterates over all dynamic sysbus devices (including
+     * uefi-vars-sysbus if "-device uefi-vars-sysbus" was passed).
+     * It uses qemu_fdt_* helpers which work on any valid FDT blob.
+     */
+    {
+        DeviceState *pbus_dev;
+        pbus_dev = qdev_find_recursive(sysbus_get_default(),
+                                       TYPE_PLATFORM_BUS_DEVICE);
+        if (pbus_dev) {
+            platform_bus_add_all_fdt_nodes(fdt, "/intc",
+                                           vms->memmap[VIRT_PLATFORM_BUS].base,
+                                           vms->memmap[VIRT_PLATFORM_BUS].size,
+                                           vms->irqmap[VIRT_PLATFORM_BUS]);
+            error_report("GH: DTB platform-bus at 0x%"PRIx64" (size 0x%"PRIx64
+                         ") with dynamic sysbus devices",
+                         (uint64_t)vms->memmap[VIRT_PLATFORM_BUS].base,
+                         (uint64_t)vms->memmap[VIRT_PLATFORM_BUS].size);
+        }
+    }
 
     /* /__symbols__ — RM needs this for DTB overlay resolution */
     {

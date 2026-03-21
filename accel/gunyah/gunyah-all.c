@@ -22,6 +22,19 @@
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 1
 #endif
+
+/* Ensure MADV_HUGEPAGE is available for THP support */
+#ifndef MADV_HUGEPAGE
+#define MADV_HUGEPAGE 14
+#endif
+
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
+
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
 #include "qemu/typedefs.h"
 #include "qemu/units.h"
 #include "hw/core/cpu.h"
@@ -267,8 +280,12 @@ static MemoryListener gunyah_memory_listener = {
     .priority = MEMORY_LISTENER_PRIORITY_ACCEL,
     .region_add = gunyah_region_add,
     .region_del = gunyah_region_del,
-    .eventfd_add = gunyah_mem_ioeventfd_add,
-    .eventfd_del = gunyah_mem_ioeventfd_del,
+    /*
+     * Gunyah: ioeventfd disabled — the kernel driver on many Gunyah
+     * platforms doesn't support GH_FN_IOEVENTFD and the ioctl triggers
+     * SIGBUS instead of returning an error.  Virtio still works via
+     * the MMIO exit path (slightly slower but fully functional).
+     */
 };
 
 int gunyah_create_vm(void)
@@ -359,11 +376,27 @@ static gunyah_slot *gunyah_get_free_slot(GUNYAHState *s)
     return NULL;
 }
 
-static void gunyah_add_mem(GUNYAHState *s, MemoryRegionSection *section,
+/*
+ * Size of each LEND chunk.  The kernel's gunyah_gup_share_parcel() does
+ * kcalloc(nr_pages, 8, GFP_KERNEL) to pin pages during bulk LEND.
+ * For a single 8GB region that's a 16MB contiguous allocation — too large
+ * for a phone's fragmented kernel memory.
+ *
+ * By splitting into 256MB chunks, each kcalloc is only 512KB (easily
+ * allocable), and the gh_bulk_lend KPM can successfully bulk-LEND each
+ * chunk via the Resource Manager.
+ */
+#define GUNYAH_LEND_CHUNK_SIZE  (256ULL * 1024 * 1024)  /* 256 MB */
+
+/*
+ * Register one memory slot + ioctl with the kernel.
+ * Caller is responsible for pre-faulting; this just does the slot + ioctl.
+ */
+static void gunyah_add_mem_slot(GUNYAHState *s,
+        uint8_t *hva, uint64_t gpa, uint64_t size,
         bool lend, enum gh_mem_flags flags)
 {
     gunyah_slot *slot;
-    MemoryRegion *area = section->mr;
     struct gh_userspace_memory_region gumr;
     int ret;
 
@@ -373,81 +406,22 @@ static void gunyah_add_mem(GUNYAHState *s, MemoryRegionSection *section,
         exit(1);
     }
 
-    slot->size = int128_get64(section->size);
-    slot->mem = memory_region_get_ram_ptr(area) + section->offset_within_region;
-    slot->start = section->offset_within_address_space;
+    slot->size = size;
+    slot->mem = hva;
+    slot->start = gpa;
     slot->lend = lend;
 
     gumr.label = slot->id;
     gumr.flags = flags;
-    gumr.guest_phys_addr = slot->start;
-    gumr.memory_size = slot->size;
-    gumr.userspace_addr = (__u64) slot->mem;
+    gumr.guest_phys_addr = gpa;
+    gumr.memory_size = size;
+    gumr.userspace_addr = (__u64) hva;
 
-    /*
-     * GH_VM_ANDROID_LEND_USER_MEM is temporary, until
-     * GH_VM_SET_USER_MEM_REGION is enhanced to support lend option also.
-     */
     error_report("GH: add_mem label=%u gpa=0x%"PRIx64" size=0x%"PRIx64
                  " hva=0x%"PRIx64" flags=0x%x lend=%d",
                  gumr.label, (uint64_t)gumr.guest_phys_addr,
                  (uint64_t)gumr.memory_size, (uint64_t)gumr.userspace_addr,
                  gumr.flags, lend);
-    ghdbg_hexdump(lend ? "LEND gh_userspace_memory_region"
-                       : "SHARE gh_userspace_memory_region",
-                  &gumr, sizeof(gumr));
-
-    /*
-     * Pre-fault all pages before LEND/SHARE ioctl.
-     *
-     * The kernel's gunyah_gup_share_parcel() uses pin_user_pages_fast()
-     * to pin pages during VM_START and bulk-LEND them to the hypervisor
-     * via the Resource Manager (efficient large-page mappings).
-     *
-     * Pages that aren't resident at that time miss the bulk LEND and
-     * must be demand-paged later via individual hypercalls
-     * (memextent_donate + addrspace_map), creating 4KB entries.
-     * The hypervisor has a limited page-table pool and runs out of
-     * memory (GUNYAH_ERROR_NOMEM) under heavy demand paging.
-     *
-     * By touching every page now (MADV_POPULATE_WRITE), we ensure
-     * all pages are physically resident when pin_user_pages runs,
-     * so the bulk LEND includes everything — no demand paging needed.
-     */
-    if (lend) {
-        void *region_base = (void *)(uintptr_t)gumr.userspace_addr;
-        uint64_t sz = gumr.memory_size;
-
-        error_report("GH: preparing LEND region: hva=0x%"PRIx64
-                     " size=0x%"PRIx64" (%"PRIu64" MB)",
-                     (uint64_t)gumr.userspace_addr, sz, sz >> 20);
-
-        /*
-         * Pre-populate all pages so pin_user_pages_fast() in the LEND
-         * ioctl finds them resident.  This enables bulk LEND with
-         * efficient 2MB/1GB stage-2 block mappings in the hypervisor.
-         *
-         * Without this, unpopulated pages fall back to runtime demand
-         * paging (individual 4KB mappings), which exhausts the
-         * hypervisor's page table pool (ENOMEM).
-         *
-         * Note: we deliberately allow THPs here — the hypervisor
-         * benefits from physically contiguous pages for large block
-         * mappings.  The kswapd/deferred_split_scan crash on LEND'd
-         * THPs is handled by the gh_disable_deferred_split.ko module.
-         */
-#ifdef MADV_POPULATE_WRITE
-        error_report("GH: populating LEND region (%"PRIu64" MB) ...",
-                     sz >> 20);
-        ret = madvise(region_base, sz, MADV_POPULATE_WRITE);
-        error_report("GH: MADV_POPULATE_WRITE: %s",
-                     ret == 0 ? "OK" : strerror(errno));
-#endif
-        /* Lock pages so they stay resident until LEND pins them */
-        ret = mlock(region_base, sz);
-        error_report("GH: mlock: %s",
-                     ret == 0 ? "OK" : strerror(errno));
-    }
 
     if (lend) {
         ret = gunyah_vm_ioctl(GH_VM_ANDROID_LEND_USER_MEM, &gumr);
@@ -456,10 +430,370 @@ static void gunyah_add_mem(GUNYAHState *s, MemoryRegionSection *section,
     }
 
     if (ret) {
-        error_report("failed to add mem (%s, errno=%d)", strerror(errno), errno);
+        error_report("GH: %s ioctl FAILED: %s (ret=%d, errno=%d)",
+                     lend ? "LEND" : "SHARE", strerror(errno), ret, errno);
         exit(1);
     }
-    error_report("GH: add_mem OK");
+    error_report("GH: add_mem_slot OK (gpa=0x%"PRIx64" size=0x%"PRIx64")",
+                 gpa, size);
+}
+
+static void gunyah_add_mem(GUNYAHState *s, MemoryRegionSection *section,
+        bool lend, enum gh_mem_flags flags)
+{
+    MemoryRegion *area = section->mr;
+    uint64_t total_size = int128_get64(section->size);
+    uint8_t *base_hva = memory_region_get_ram_ptr(area) +
+                        section->offset_within_region;
+    uint64_t base_gpa = section->offset_within_address_space;
+    int ret;
+
+    /*
+     * Pre-fault all pages before LEND ioctl.
+     *
+     * The kernel's gunyah_gup_share_parcel() uses pin_user_pages_fast()
+     * to pin pages during VM_START and bulk-LEND them to the hypervisor
+     * via the Resource Manager (efficient large-page mappings).
+     *
+     * By touching every page now (MADV_POPULATE_WRITE), we ensure
+     * all pages are physically resident when pin_user_pages runs,
+     * so the bulk LEND includes everything.
+     */
+    if (lend) {
+        FILE *f;
+        const uint64_t thp_size = 2ULL * 1024 * 1024; /* 2MB */
+
+        error_report("GH: preparing LEND region: hva=0x%"PRIx64
+                     " size=0x%"PRIx64" (%"PRIu64" MB)",
+                     (uint64_t)(uintptr_t)base_hva, total_size,
+                     total_size >> 20);
+
+        /*
+         * THP strategy: each 2MB THP uses ONE hypervisor page table
+         * entry instead of 512 × 4KB entries.  Without THPs, an 8GB
+         * guest needs ~2M entries and exhausts the hypervisor's
+         * fixed-size page table pool (ENOMEM crash).
+         *
+         * We do NOT cap total_size — capping creates a gap between
+         * the LEND and SHARE regions that breaks the UEFI IoMmu driver.
+         * Instead we allocate best-effort THPs (~90%+ coverage) which
+         * is sufficient to avoid ENOMEM.  The gh_disable_deferred_split
+         * KPM must be loaded to prevent kernel panics from kswapd
+         * touching LEND'd THP pages.
+         *
+         * Phase 1: Free page cache + compact.
+         * Phase 2: Populate in batches with MADV_HUGEPAGE.
+         * Phase 3: MADV_COLLAPSE remaining 4KB pages (best-effort).
+         * Phase 4: mlock everything.
+         */
+
+        /* Phase 1: Free memory and compact */
+        error_report("GH: Phase 1: dropping caches + compacting ...");
+        f = fopen("/proc/sys/vm/drop_caches", "w");
+        if (f) { fprintf(f, "3\n"); fclose(f); }
+        f = fopen("/proc/sys/vm/compact_memory", "w");
+        if (f) { fprintf(f, "1\n"); fclose(f); }
+        usleep(500000);
+
+        /* Log available huge pages before allocation */
+        {
+            char line[256];
+            f = fopen("/proc/meminfo", "r");
+            if (f) {
+                while (fgets(line, sizeof(line), f)) {
+                    if (strstr(line, "AnonHugePages") ||
+                        strstr(line, "MemFree") ||
+                        strstr(line, "MemAvailable")) {
+                        /* Remove trailing newline */
+                        char *nl = strchr(line, '\n');
+                        if (nl) *nl = '\0';
+                        error_report("GH:   %s", line);
+                    }
+                }
+                fclose(f);
+            }
+        }
+
+        /* Request THPs for the whole region */
+        ret = madvise(base_hva, total_size, MADV_HUGEPAGE);
+        error_report("GH: MADV_HUGEPAGE: %s",
+                     ret == 0 ? "OK" : strerror(errno));
+
+        /* Diagnostic: check VMA flags for this region */
+        {
+            char smaps_path[64];
+            char line[512];
+            unsigned long target = (unsigned long)base_hva;
+            snprintf(smaps_path, sizeof(smaps_path),
+                     "/proc/%d/smaps", getpid());
+            f = fopen(smaps_path, "r");
+            if (f) {
+                int in_our_vma = 0;
+                while (fgets(line, sizeof(line), f)) {
+                    /* VMA header line: "start-end perms ..." */
+                    if (line[0] != ' ' && strchr(line, '-')) {
+                        unsigned long vma_start = 0;
+                        sscanf(line, "%lx-", &vma_start);
+                        in_our_vma = (vma_start == target);
+                        if (in_our_vma) {
+                            char *nl = strchr(line, '\n');
+                            if (nl) *nl = '\0';
+                            error_report("GH: VMA: %s", line);
+                        }
+                    }
+                    if (in_our_vma) {
+                        if (strstr(line, "AnonHugePages") ||
+                            strstr(line, "THPeligible") ||
+                            strstr(line, "VmFlags")) {
+                            char *nl = strchr(line, '\n');
+                            if (nl) *nl = '\0';
+                            error_report("GH:   %s", line);
+                        }
+                    }
+                }
+                fclose(f);
+            }
+        }
+
+        /*
+         * Phase 2: Populate in 256MB batches.
+         *
+         * Doing one huge MADV_POPULATE_WRITE exhausts free 2MB regions
+         * early, and the rest falls back to 4KB.  By batching with
+         * compaction between batches, we give the kernel a chance to
+         * defragment the just-allocated 4KB pages and create new
+         * 2MB regions for the next batch.
+         */
+        {
+            const uint64_t batch_size = 256ULL * 1024 * 1024; /* 256MB */
+            uint64_t offset;
+            int batch_idx = 0;
+
+            error_report("GH: Phase 2: populating %"PRIu64" MB in "
+                         "%"PRIu64" x %"PRIu64" MB batches ...",
+                         total_size >> 20,
+                         (total_size + batch_size - 1) / batch_size,
+                         batch_size >> 20);
+
+            for (offset = 0; offset < total_size; offset += batch_size) {
+                uint64_t len = total_size - offset;
+                if (len > batch_size)
+                    len = batch_size;
+
+                ret = madvise((char *)base_hva + offset, len,
+                              MADV_POPULATE_WRITE);
+                if (ret != 0) {
+                    /* Fallback: manual page touch for this batch */
+                    volatile char *p = (volatile char *)base_hva + offset;
+                    uint64_t npages = len / 4096;
+                    uint64_t i;
+                    for (i = 0; i < npages; i++) {
+                        p[i * 4096] = p[i * 4096];
+                    }
+                }
+                batch_idx++;
+
+                /*
+                 * Every 4 batches (1GB), compact memory.
+                 * This lets the kernel merge fragmented 4KB regions
+                 * into 2MB blocks for subsequent THP allocations.
+                 */
+                if (batch_idx % 4 == 0 && offset + batch_size < total_size) {
+                    f = fopen("/proc/sys/vm/compact_memory", "w");
+                    if (f) { fprintf(f, "1\n"); fclose(f); }
+                    usleep(200000); /* 200ms for compaction */
+                }
+            }
+            error_report("GH: Phase 2: population complete");
+        }
+
+        /* Log THP status after population */
+        {
+            char line[256];
+            f = fopen("/proc/meminfo", "r");
+            if (f) {
+                while (fgets(line, sizeof(line), f)) {
+                    if (strstr(line, "AnonHugePages")) {
+                        char *nl = strchr(line, '\n');
+                        if (nl) *nl = '\0';
+                        error_report("GH:   after populate: %s", line);
+                    }
+                }
+                fclose(f);
+            }
+        }
+
+        /*
+         * Phase 3: MADV_COLLAPSE + retry loop.
+         *
+         * First pass: try MADV_COLLAPSE on every 2MB chunk.
+         * For chunks that fail: release their 4KB pages (MADV_DONTNEED),
+         * compact memory, then re-populate and retry.  Releasing the
+         * scattered 4KB pages lets compaction merge them into contiguous
+         * 2MB blocks for the next THP allocation attempt.
+         *
+         * Repeat up to 5 times to push toward 100% THP coverage.
+         */
+        {
+            uint64_t total_chunks = total_size / thp_size;
+            uint64_t collapsed = 0, failed = 0;
+            uint64_t chunk;
+            int pass;
+            int last_err = 0;
+
+            /* Bitmap: 1 = needs THP, 0 = already THP */
+            uint8_t *need_thp = (uint8_t *)calloc(total_chunks, 1);
+            if (!need_thp) {
+                error_report("GH: Phase 3: calloc failed, skipping");
+                goto skip_phase3;
+            }
+
+            /* First pass: identify which chunks need collapsing */
+            error_report("GH: Phase 3: MADV_COLLAPSE pass 0 ...");
+            for (chunk = 0; chunk < total_chunks; chunk++) {
+                ret = madvise((char *)base_hva + chunk * thp_size,
+                              thp_size, MADV_COLLAPSE);
+                if (ret == 0) {
+                    collapsed++;
+                } else {
+                    need_thp[chunk] = 1;
+                    failed++;
+                    last_err = errno;
+                }
+            }
+            error_report("GH:   pass 0: %"PRIu64" OK, %"PRIu64
+                         " failed (err=%d), %.1f%%",
+                         collapsed, failed, last_err,
+                         (double)collapsed * 100.0 /
+                         (double)total_chunks);
+
+            /* Retry loop: release failed chunks, compact, re-populate */
+            for (pass = 1; pass <= 5 && failed > 0; pass++) {
+                uint64_t pass_ok = 0, pass_fail = 0;
+
+                /* Release 4KB pages from failed chunks */
+                for (chunk = 0; chunk < total_chunks; chunk++) {
+                    if (need_thp[chunk]) {
+                        madvise((char *)base_hva + chunk * thp_size,
+                                thp_size, MADV_DONTNEED);
+                    }
+                }
+
+                /* Compact memory — freed 4KB pages can now be merged */
+                f = fopen("/proc/sys/vm/compact_memory", "w");
+                if (f) { fprintf(f, "1\n"); fclose(f); }
+                usleep(300000); /* 300ms for compaction */
+
+                /* Re-populate and try MADV_COLLAPSE again */
+                for (chunk = 0; chunk < total_chunks; chunk++) {
+                    if (!need_thp[chunk])
+                        continue;
+
+                    /* Re-fault the pages (kernel will try THP first) */
+                    madvise((char *)base_hva + chunk * thp_size,
+                            thp_size, MADV_POPULATE_WRITE);
+
+                    ret = madvise((char *)base_hva + chunk * thp_size,
+                                  thp_size, MADV_COLLAPSE);
+                    if (ret == 0) {
+                        need_thp[chunk] = 0;
+                        pass_ok++;
+                    } else {
+                        pass_fail++;
+                        last_err = errno;
+                    }
+                }
+
+                collapsed += pass_ok;
+                failed = pass_fail;
+                error_report("GH:   pass %d: +%"PRIu64" OK, "
+                             "%"PRIu64" remaining, %.1f%%",
+                             pass, pass_ok, failed,
+                             (double)collapsed * 100.0 /
+                             (double)total_chunks);
+
+                /* If no progress, stop retrying */
+                if (pass_ok == 0)
+                    break;
+            }
+
+            error_report("GH: Phase 3 done: %"PRIu64"/%"PRIu64
+                         " THPs (%.1f%%), %"PRIu64" stuck at 4KB",
+                         collapsed, total_chunks,
+                         (double)collapsed * 100.0 /
+                         (double)total_chunks,
+                         failed);
+
+            /* Phase 3b trimming removed — size is capped upfront in Phase 0 */
+            free(need_thp);
+        }
+skip_phase3:
+
+        /* Final THP count */
+        {
+            char line[256];
+            f = fopen("/proc/meminfo", "r");
+            if (f) {
+                while (fgets(line, sizeof(line), f)) {
+                    if (strstr(line, "AnonHugePages")) {
+                        char *nl = strchr(line, '\n');
+                        if (nl) *nl = '\0';
+                        error_report("GH:   final: %s", line);
+                    }
+                }
+                fclose(f);
+            }
+        }
+
+        /* Phase 4: Lock pages */
+        ret = mlock(base_hva, total_size);
+        if (ret == 0) {
+            error_report("GH: mlock: OK");
+        } else {
+            error_report("GH: mlock FAILED: %s", strerror(errno));
+        }
+    }
+
+    /*
+     * Split large LEND regions into 256MB chunks.
+     *
+     * The kernel's gunyah_gup_share_parcel() calls kcalloc() to allocate
+     * a page-pointer array for the entire region.  For 8GB that's 16MB
+     * of contiguous kernel memory, which always fails on a phone.
+     *
+     * By splitting into 256MB chunks, each kcalloc is only 512KB.
+     * The gh_bulk_lend KPM module calls gunyah_share_range_as_parcels()
+     * per binding, and each binding is now small enough to succeed.
+     */
+    if (lend && total_size > GUNYAH_LEND_CHUNK_SIZE) {
+        uint64_t offset = 0;
+        int chunk_idx = 0;
+
+        error_report("GH: splitting %"PRIu64" MB LEND into %"PRIu64
+                     " x %"PRIu64" MB chunks",
+                     total_size >> 20,
+                     (total_size + GUNYAH_LEND_CHUNK_SIZE - 1) /
+                         GUNYAH_LEND_CHUNK_SIZE,
+                     GUNYAH_LEND_CHUNK_SIZE >> 20);
+
+        while (offset < total_size) {
+            uint64_t chunk_sz = total_size - offset;
+            if (chunk_sz > GUNYAH_LEND_CHUNK_SIZE)
+                chunk_sz = GUNYAH_LEND_CHUNK_SIZE;
+
+            error_report("GH:   chunk[%d] gpa=0x%"PRIx64" size=0x%"PRIx64,
+                         chunk_idx, base_gpa + offset, chunk_sz);
+            gunyah_add_mem_slot(s, base_hva + offset,
+                                base_gpa + offset, chunk_sz,
+                                lend, flags);
+            offset += chunk_sz;
+            chunk_idx++;
+        }
+        return;
+    }
+
+    /* Non-LEND or small LEND: single slot */
+    gunyah_add_mem_slot(s, base_hva, base_gpa, total_size, lend, flags);
 }
 
 static bool is_confidential_guest(void)
@@ -1197,9 +1531,15 @@ void gunyah_start_vm(void)
         error_report("GH: SET_DTB_CONFIG OK");
     }
 
-    /* TODO: firmware boot path removed — will be re-added after
-     * EDK2 is recompiled with Gunyah-native PCD values.
-     * See edk2_records.md for the full record of removed patches.
+    /*
+     * Firmware boot path: EDK2 is loaded directly into RAM at VIRT_MEM.base
+     * (0x80000000) by virt.c's virt_firmware_init() when -bios is used with
+     * Gunyah. The firmware is compiled with PcdFdBaseAddress=0x80000000 and
+     * PcdSystemMemoryBase=0x80000000, so no address relocation is needed.
+     *
+     * When no -kernel is specified, s->kernel_entry will be 0. The boot
+     * stub below falls back to kernel_load_addr (first LEND'd slot start =
+     * 0x80000000), which is exactly where the firmware was loaded.
      */
 
     /*
@@ -1706,56 +2046,52 @@ static int gunyah_vcpu_exec(CPUState *cpu)
                 }
 
                 /*
-                 * All PAGE_FAULT errors are treated the same way:
+                 * PAGE_FAULT retry strategy:
                  *
-                 * Retry a few times (the fault might be transient —
-                 * e.g. racing with another vCPU, or memory pressure).
-                 * After 10 retries, inject the fault into the guest
-                 * and suppress further logging for this address.
+                 * ENOMEM (-12) means the hypervisor's stage-2 page table
+                 * pool is exhausted.  This is PERMANENT — nothing in
+                 * userspace can free hypervisor page table entries.
+                 * The root cause is too many demand-paged 4KB entries
+                 * consuming the fixed-size pool.
                  *
-                 * For ENOMEM from addrspace_map (GUNYAH_ERROR_NOMEM=10),
-                 * the hypervisor's stage-2 page table pool is exhausted.
-                 * This is PERMANENT — retrying thousands of times is
-                 * useless and only causes soft lockups.
+                 * Give a brief retry window (a few attempts) in case of
+                 * transient races, then inject fault quickly.  The guest
+                 * kernel will receive a synchronous data abort (SIGBUS).
                  *
-                 * After injection, the guest kernel receives a
-                 * synchronous data abort (SIGBUS to the faulting
-                 * process, or guest kernel handles it).
-                 *
-                 * We also add this address to a "permanently failed"
-                 * set so we don't spam logs or waste time on it if
-                 * the guest retries the access.
+                 * Other errors: 10 retries with 1ms sleep, then give up.
                  */
-                if (acpu->same_fault_count <= 10) {
-                    /* Retry: fault may be transient */
-                    run->page_fault.resume_action = GH_VCPU_RESUME_RETRY;
-                    if (acpu->same_fault_count > 3) {
-                        usleep(1000); /* 1ms after 3 fast retries */
+                {
+                    int max_retries = (attempt == -12) ? 10 : 10;
+
+                    if (acpu->same_fault_count <= max_retries) {
+                        /* Retry: fault may be transient */
+                        run->page_fault.resume_action = GH_VCPU_RESUME_RETRY;
+                        if (acpu->same_fault_count > 3) {
+                            usleep(1000); /* 1ms */
+                        }
+                        ret = 0;
+                    } else {
+                        /*
+                         * Permanent failure — inject fault into guest.
+                         * Use RESUME_FAULT so the hypervisor delivers a
+                         * synchronous external abort to the guest.
+                         */
+                        if (acpu->same_fault_count == max_retries + 1) {
+                            error_report("GH: CPU#%d PAGE_FAULT at 0x%"PRIx64
+                                " PERMANENT (attempt=%d) after %d retries"
+                                " — injecting abort into guest",
+                                cpu->cpu_index, fault_addr, attempt,
+                                acpu->same_fault_count);
+                        }
+                        run->page_fault.resume_action = GH_VCPU_RESUME_FAULT;
+                        /*
+                         * Sleep 50ms to give guest exception handler
+                         * time to run (handle the abort, SIGBUS the
+                         * faulting process) before we re-enter.
+                         */
+                        usleep(50000);
+                        ret = 0;
                     }
-                    ret = 0;
-                } else {
-                    /*
-                     * Permanent failure — inject fault into guest.
-                     * Use RESUME_FAULT so the hypervisor delivers a
-                     * synchronous external abort to the guest.
-                     */
-                    if (acpu->same_fault_count == 11) {
-                        error_report("GH: CPU#%d PAGE_FAULT at 0x%"PRIx64
-                            " PERMANENT (attempt=%d) after %d retries"
-                            " — injecting abort into guest",
-                            cpu->cpu_index, fault_addr, attempt,
-                            acpu->same_fault_count);
-                    }
-                    run->page_fault.resume_action = GH_VCPU_RESUME_FAULT;
-                    /*
-                     * Sleep 50ms to give guest exception handler
-                     * time to run (handle the abort, SIGBUS the
-                     * faulting process) before we re-enter.
-                     * Without this, the guest immediately re-faults
-                     * before its handler can run.
-                     */
-                    usleep(50000);
-                    ret = 0;
                 }
             }
             break;

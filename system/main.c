@@ -82,11 +82,24 @@ int main(int argc, char **argv)
      * CPU loses access.  If any THPs were allocated, kswapd's
      * deferred_split_scan will try to inspect those pages via the kernel
      * direct map (memchr_inv), triggering a fatal synchronous external
-     * abort.  PR_SET_THP_DISABLE prevents the kernel from ever creating
-     * THPs in this process, regardless of the system-wide THP setting.
+     * abort.
+     *
+     * PREVIOUSLY we used PR_SET_THP_DISABLE here, but that prevents ALL
+     * THPs — including the ones we NEED for demand paging efficiency.
+     * Each 2MB THP uses ONE hypervisor page table entry instead of 512
+     * 4KB entries.  Without THPs, 8GB of demand-paged memory exhausts
+     * the hypervisor's fixed-size page table pool (ENOMEM).
+     *
+     * The deferred_split_scan crash is now handled by the
+     * gh_disable_deferred_split KernelPatch module (KPM), which hooks
+     * deferred_split_scan to skip LEND'd pages safely.
+     *
+     * DO NOT re-enable PR_SET_THP_DISABLE without the KPM installed.
      */
+#if 0  /* Disabled — use gh_disable_deferred_split KPM instead */
 #ifdef __linux__
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+#endif
 #endif
 
     qemu_init(argc, argv);
