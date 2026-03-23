@@ -17,6 +17,9 @@ typedef struct egl_dpy {
     bool y_0_top;
     uint32_t pos_x;
     uint32_t pos_y;
+#ifdef __ANDROID__
+    QEMUCursor *cursor;
+#endif
 } egl_dpy;
 
 /* ------------------------------------------------------------------ */
@@ -139,6 +142,85 @@ static void egl_cursor_position(DisplayChangeListener *dcl,
     edpy->pos_y = pos_y;
 }
 
+#ifdef __ANDROID__
+static void egl_cursor_define(DisplayChangeListener *dcl,
+                              QEMUCursor *cursor)
+{
+    egl_dpy *edpy = container_of(dcl, egl_dpy, dcl);
+
+    cursor_unref(edpy->cursor);
+    edpy->cursor = cursor_ref(cursor);
+}
+
+static void egl_mouse_set(DisplayChangeListener *dcl,
+                           int x, int y, bool on)
+{
+    egl_dpy *edpy = container_of(dcl, egl_dpy, dcl);
+
+    edpy->pos_x = x;
+    edpy->pos_y = y;
+}
+
+/* Software cursor compositing: blend RGBA cursor onto BGRA surface */
+static void egl_blend_cursor(egl_dpy *edpy)
+{
+    QEMUCursor *c = edpy->cursor;
+    DisplaySurface *ds = edpy->ds;
+    uint32_t *dst, *src;
+    int sw, sh, cx, cy, cw, ch;
+    int x, y;
+
+    if (!c || !ds) {
+        return;
+    }
+
+    sw = surface_width(ds);
+    sh = surface_height(ds);
+    cx = edpy->pos_x;
+    cy = edpy->pos_y;
+    cw = c->width;
+    ch = c->height;
+    dst = (uint32_t *)surface_data(ds);
+    src = c->data;
+
+    for (y = 0; y < ch; y++) {
+        int dy = cy + y;
+        if (dy < 0 || dy >= sh) continue;
+        for (x = 0; x < cw; x++) {
+            int dx = cx + x;
+            if (dx < 0 || dx >= sw) continue;
+
+            uint32_t sp = src[y * cw + x];
+            uint32_t sa = (sp >> 24) & 0xFF;
+            if (sa == 0) continue;
+
+            uint32_t dp = dst[dy * sw + dx];
+            if (sa == 0xFF) {
+                /* Cursor pixel is ARGB, surface is BGRX after our swizzle.
+                 * Swap R and B from cursor to match surface format. */
+                dst[dy * sw + dx] = ((sp & 0x00FF0000) >> 16) |
+                                     (sp & 0xFF00FF00) |
+                                    ((sp & 0x000000FF) << 16);
+            } else {
+                /* Alpha blend with R<->B swap */
+                uint32_t sr = (sp >> 16) & 0xFF;
+                uint32_t sg = (sp >> 8) & 0xFF;
+                uint32_t sb = sp & 0xFF;
+                uint32_t dr = dp & 0xFF;         /* B in BGRX = R display */
+                uint32_t dg = (dp >> 8) & 0xFF;
+                uint32_t db = (dp >> 16) & 0xFF;  /* R in BGRX = B display */
+                uint32_t da = sa;
+                uint32_t ia = 255 - sa;
+                dr = (sr * da + dr * ia) / 255;
+                dg = (sg * da + dg * ia) / 255;
+                db = (sb * da + db * ia) / 255;
+                dst[dy * sw + dx] = (dr) | (dg << 8) | (db << 16) | 0xFF000000;
+            }
+        }
+    }
+}
+#endif
+
 static void egl_scanout_flush(DisplayChangeListener *dcl,
                               uint32_t x, uint32_t y,
                               uint32_t w, uint32_t h)
@@ -148,8 +230,61 @@ static void egl_scanout_flush(DisplayChangeListener *dcl,
     if (!edpy->guest_fb.texture || !edpy->ds) {
         return;
     }
+
+    /* Drain any prior GL errors from virglrenderer */
+    while (glGetError() != GL_NO_ERROR) {}
+
     assert(surface_format(edpy->ds) == PIXMAN_x8r8g8b8);
 
+#ifdef __ANDROID__
+    /*
+     * On Android/GLES, skip the intermediate blit entirely.
+     * The blit uses VAOs and shader programs that were created in the
+     * render-node EGL context, but flush runs in virglrenderer's context
+     * where those VAOs don't exist. Instead, read directly from the
+     * guest framebuffer with Y-flip handling in software.
+     */
+    /* Ensure all virglrenderer GL commands are completed before readback. */
+    glFinish();
+
+#ifdef __ANDROID__
+    /* On Adreno GLES, we must use virglrenderer's own FBO to read the
+     * texture content. Virglrenderer uses FBO 1 for rendering.
+     * First try FBO 1, then fall back to re-attaching to our FBO. */
+    {
+        /* Bind virglrenderer's FBO and check if our texture is attached */
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 1);
+        GLint attached_tex = 0;
+        glGetFramebufferAttachmentParameteriv(GL_READ_FRAMEBUFFER,
+            GL_COLOR_ATTACHMENT0,
+            GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+            &attached_tex);
+
+        if ((GLuint)attached_tex == edpy->guest_fb.texture) {
+            /* Great - virgl's FBO already has our texture, read from it */
+            edpy->guest_fb.framebuffer = 1;
+        } else {
+            /* Texture not attached to FBO 1, re-attach to our FBO.
+             * Also try attaching our texture to FBO 1. */
+            glBindFramebuffer(GL_FRAMEBUFFER, 1);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, edpy->guest_fb.texture, 0);
+            edpy->guest_fb.framebuffer = 1;
+        }
+        while (glGetError() != GL_NO_ERROR) {}
+    }
+#else
+    glBindFramebuffer(GL_FRAMEBUFFER, edpy->guest_fb.framebuffer);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, edpy->guest_fb.texture, 0);
+#endif
+
+    egl_fb_read_flipped(edpy->ds, &edpy->guest_fb, edpy->y_0_top);
+
+    /* Don't software-blend cursor — VNC handles it via dpy_cursor_define */
+
+    (void)glGetError(); /* consume any read error */
+#else
     if (edpy->cursor_fb.texture) {
         /* have cursor -> render using textures */
         egl_texture_blit(edpy->gls, &edpy->blit_fb, &edpy->guest_fb,
@@ -163,6 +298,8 @@ static void egl_scanout_flush(DisplayChangeListener *dcl,
     }
 
     egl_fb_read(edpy->ds, &edpy->blit_fb);
+#endif
+
     dpy_gfx_update(edpy->dcl.con, x, y, w, h);
 }
 
@@ -181,6 +318,10 @@ static const DisplayChangeListenerOps egl_ops = {
 #endif
     .dpy_gl_cursor_position  = egl_cursor_position,
     .dpy_gl_update           = egl_scanout_flush,
+#ifdef __ANDROID__
+    .dpy_cursor_define       = egl_cursor_define,
+    .dpy_mouse_set           = egl_mouse_set,
+#endif
 };
 
 static bool

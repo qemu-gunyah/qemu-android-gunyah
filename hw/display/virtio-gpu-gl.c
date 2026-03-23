@@ -32,6 +32,7 @@ static void virtio_gpu_gl_update_cursor_data(VirtIOGPU *g,
     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
     uint32_t width, height;
     uint32_t pixels, *data;
+    struct virtio_gpu_simple_resource *res;
 
     if (gl->renderer_state != RS_INITED) {
         return;
@@ -50,6 +51,53 @@ static void virtio_gpu_gl_update_cursor_data(VirtIOGPU *g,
 
     pixels = s->current_cursor->width * s->current_cursor->height;
     memcpy(s->current_cursor->data, data, pixels * sizeof(uint32_t));
+
+    /* Gunyah fix: if cursor texture is all zeros (LEND'd memory issue),
+     * generate a default arrow cursor so the user can see something */
+    {
+        int nonzero = 0;
+        for (uint32_t i = 0; i < pixels; i++) {
+            if (data[i]) nonzero++;
+        }
+        if (nonzero == 0) {
+            /* Gunyah fix: GL cursor texture is empty (LEND'd memory).
+             * Try IOV first, then fall back to a default arrow cursor. */
+            bool got_iov = false;
+            res = virtio_gpu_find_resource(g, resource_id);
+            if (res && res->iov && res->iov_cnt > 0) {
+                size_t cursor_bytes = pixels * sizeof(uint32_t);
+                size_t offset = 0;
+                uint32_t *cdata = s->current_cursor->data;
+                for (int i = 0; i < res->iov_cnt && offset < cursor_bytes; i++) {
+                    size_t chunk = res->iov[i].iov_len;
+                    if (chunk > cursor_bytes - offset) chunk = cursor_bytes - offset;
+                    memcpy((uint8_t *)cdata + offset, res->iov[i].iov_base, chunk);
+                    offset += chunk;
+                }
+                for (uint32_t i = 0; i < pixels; i++) {
+                    if (cdata[i]) { got_iov = true; break; }
+                }
+            }
+            if (!got_iov && width >= 16 && height >= 16) {
+                /* Fall back to default arrow cursor */
+                static const char *arrow[] = {
+                    "B","BB","BWB","BWWB","BWWWB","BWWWWB","BWWWWWB",
+                    "BWWWWWWB","BWWWWWWWB","BWWWWWWWWB","BWWWWWWWWWB",
+                    "BWWWWWWBBBB","BWWWBWWB","BWWBBWWB","BWB..BWWB",
+                    "BB...BWWB","B.....BWWB","......BWWB",".......BB",
+                };
+                uint32_t *cdata = s->current_cursor->data;
+                memset(cdata, 0, pixels * sizeof(uint32_t));
+                for (int y = 0; y < 19 && y < (int)height; y++) {
+                    const char *row = arrow[y];
+                    for (int x = 0; row[x] && x < (int)width; x++) {
+                        if (row[x] == 'B') cdata[y * width + x] = 0xFF000000;
+                        else if (row[x] == 'W') cdata[y * width + x] = 0xFFFFFFFF;
+                    }
+                }
+            }
+        }
+    }
     free(data);
 }
 

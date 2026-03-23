@@ -60,7 +60,11 @@ endif
 system_ss.add(opengl)
 if opengl.found()
   opengl_ss = ss.source_set()
-  opengl_ss.add(gbm, pixman)
+  if gbm.found()
+    opengl_ss.add(gbm, pixman)
+  else
+    opengl_ss.add(pixman)
+  endif
   opengl_ss.add(when: [opengl],
                if_true: files('shader.c', 'console-gl.c', 'egl-helpers.c', 'egl-context.c'))
   ui_modules += {'opengl' : opengl_ss}
@@ -68,8 +72,13 @@ endif
 
 if opengl.found()
   egl_headless_ss = ss.source_set()
-  egl_headless_ss.add(when: [opengl, pixman],
-                      if_true: [files('egl-headless.c'), gbm])
+  if gbm.found()
+    egl_headless_ss.add(when: [opengl, pixman],
+                        if_true: [files('egl-headless.c'), gbm])
+  else
+    egl_headless_ss.add(when: [opengl, pixman],
+                        if_true: files('egl-headless.c'))
+  endif
   ui_modules += {'egl-headless' : egl_headless_ss}
 endif
 

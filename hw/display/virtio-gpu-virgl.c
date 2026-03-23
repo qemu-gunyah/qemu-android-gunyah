@@ -13,6 +13,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
+#include <epoxy/gl.h>
 #include "qemu/iov.h"
 #include "trace.h"
 #include "hw/virtio/virtio.h"
@@ -388,6 +389,11 @@ static void virgl_cmd_resource_flush(VirtIOGPU *g,
     trace_virtio_gpu_cmd_res_flush(rf.resource_id,
                                    rf.r.width, rf.r.height, rf.r.x, rf.r.y);
 
+    /* Ensure all rendering is complete before display readback.
+     * On Adreno GLES, cross-context texture visibility requires
+     * explicit synchronization. */
+    glFinish();
+
     for (i = 0; i < g->parent_obj.conf.max_outputs; i++) {
         if (g->parent_obj.scanout[i].resource_id != rf.resource_id) {
             continue;
@@ -437,13 +443,18 @@ static void virgl_cmd_set_scanout(VirtIOGPU *g,
         }
         qemu_console_resize(g->parent_obj.scanout[ss.scanout_id].con,
                             ss.r.width, ss.r.height);
-        virgl_renderer_force_ctx_0();
+        /* CRITICAL: Set up the scanout texture BEFORE force_ctx_0 so the
+         * FBO is created in the RENDERING EGL context. On Adreno GLES,
+         * FBOs are per-context objects and texture content is only
+         * readable from the context that rendered to them. */
+        glFinish();
         dpy_gl_scanout_texture(
             g->parent_obj.scanout[ss.scanout_id].con, info.tex_id,
             info.flags & VIRTIO_GPU_RESOURCE_FLAG_Y_0_TOP,
             info.width, info.height,
             ss.r.x, ss.r.y, ss.r.width, ss.r.height,
             d3d_tex2d);
+        virgl_renderer_force_ctx_0();
     } else {
         dpy_gfx_replace_surface(
             g->parent_obj.scanout[ss.scanout_id].con, NULL);
@@ -463,6 +474,12 @@ static void virgl_cmd_submit_3d(VirtIOGPU *g,
     trace_virtio_gpu_cmd_ctx_submit(cs.hdr.ctx_id, cs.size);
 
     buf = g_malloc(cs.size);
+
+    /* Gunyah: data cache barrier before reading SHARE'd memory.
+     * The guest VM writes to bounce buffer pages, but the host
+     * may see stale cache data without a barrier. */
+    __sync_synchronize();
+
     s = iov_to_buf(cmd->elem.out_sg, cmd->elem.out_num,
                    sizeof(cs), buf, cs.size);
     if (s != cs.size) {

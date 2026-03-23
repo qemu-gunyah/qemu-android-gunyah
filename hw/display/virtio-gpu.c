@@ -74,6 +74,26 @@ void virtio_gpu_update_cursor_data(VirtIOGPU *g,
     pixels = s->current_cursor->width * s->current_cursor->height;
     memcpy(s->current_cursor->data, data,
            pixels * sizeof(uint32_t));
+
+    /* Gunyah fix: if cursor data is all zeros (LEND'd memory), try IOV fallback */
+    {
+        uint32_t *cdata = s->current_cursor->data;
+        int nonzero = 0;
+        for (uint32_t i = 0; i < pixels; i++) {
+            if (cdata[i]) { nonzero = 1; break; }
+        }
+
+        if (nonzero == 0 && res->iov && res->iov_cnt > 0) {
+            size_t cursor_bytes = pixels * sizeof(uint32_t);
+            size_t offset = 0;
+            for (int i = 0; i < res->iov_cnt && offset < cursor_bytes; i++) {
+                size_t chunk = res->iov[i].iov_len;
+                if (chunk > cursor_bytes - offset) chunk = cursor_bytes - offset;
+                memcpy((uint8_t *)cdata + offset, res->iov[i].iov_base, chunk);
+                offset += chunk;
+            }
+        }
+    }
 }
 
 static void update_cursor(VirtIOGPU *g, struct virtio_gpu_update_cursor *cursor)
@@ -92,7 +112,6 @@ static void update_cursor(VirtIOGPU *g, struct virtio_gpu_update_cursor *cursor)
                                    cursor->pos.y,
                                    move ? "move" : "update",
                                    cursor->resource_id);
-
     if (!move) {
         if (!s->current_cursor) {
             s->current_cursor = cursor_alloc(64, 64);

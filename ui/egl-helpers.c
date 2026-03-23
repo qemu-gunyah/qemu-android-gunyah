@@ -127,8 +127,14 @@ void egl_fb_setup_new_tex(egl_fb *fb, int width, int height)
 
     glGenTextures(1, &texture);
     glBindTexture(GL_TEXTURE_2D, texture);
+#ifdef __ANDROID__
+    /* GLES does not support GL_BGRA as a pixel transfer format */
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height,
+                 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+#else
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height,
                  0, GL_BGRA, GL_UNSIGNED_BYTE, 0);
+#endif
 
     egl_fb_setup_for_tex(fb, width, height, texture, true);
 }
@@ -166,10 +172,47 @@ void egl_fb_blit(egl_fb *dst, egl_fb *src, bool flip)
 
 void egl_fb_read(DisplaySurface *dst, egl_fb *src)
 {
+    egl_fb_read_flipped(dst, src, false);
+}
+
+void egl_fb_read_flipped(DisplaySurface *dst, egl_fb *src, bool flip)
+{
     glBindFramebuffer(GL_READ_FRAMEBUFFER, src->framebuffer);
+#ifndef __ANDROID__
+    (void)flip; /* desktop path uses blit for flipping */
     glReadBuffer(GL_COLOR_ATTACHMENT0_EXT);
     glReadPixels(0, 0, surface_width(dst), surface_height(dst),
                  GL_BGRA, GL_UNSIGNED_BYTE, surface_data(dst));
+#else
+    /*
+     * GLES does not support GL_BGRA for glReadPixels and may not have
+     * glReadBuffer.  Read as GL_RGBA into a temp buffer, then swizzle
+     * R<->B and optionally flip Y into the destination surface.
+     */
+    {
+        int w = surface_width(dst);
+        int h = surface_height(dst);
+        int stride = surface_stride(dst);
+        uint8_t *dst_data = (uint8_t *)surface_data(dst);
+        uint8_t *tmp = g_malloc(w * h * 4);
+
+        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, tmp);
+
+        for (int row = 0; row < h; row++) {
+            /* If flip, read from bottom row first */
+            int src_row = flip ? (h - 1 - row) : row;
+            uint32_t *sp = (uint32_t *)(tmp + src_row * w * 4);
+            uint32_t *dp = (uint32_t *)(dst_data + row * stride);
+            for (int col = 0; col < w; col++) {
+                uint32_t p = sp[col];
+                dp[col] = ((p & 0x00FF0000) >> 16) |
+                           (p & 0xFF00FF00)         |
+                          ((p & 0x000000FF) << 16);
+            }
+        }
+        g_free(tmp);
+    }
+#endif
 }
 
 void egl_fb_read_rect(DisplaySurface *dst, egl_fb *src, int x, int y, int w, int h)
@@ -179,18 +222,46 @@ void egl_fb_read_rect(DisplaySurface *dst, egl_fb *src, int x, int y, int w, int
     assert(surface_format(dst) == PIXMAN_x8r8g8b8);
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, src->framebuffer);
+#ifndef __ANDROID__
     glReadBuffer(GL_COLOR_ATTACHMENT0_EXT);
     glPixelStorei(GL_PACK_ROW_LENGTH, surface_stride(dst) / 4);
     glReadPixels(x, y, w, h,
                  GL_BGRA, GL_UNSIGNED_BYTE, surface_data(dst) + x * 4);
     glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+#else
+    /*
+     * GLES: no GL_BGRA, no GL_PACK_ROW_LENGTH (ES 2.0).
+     * Read into a temp buffer, then swizzle R<->B into the destination.
+     */
+    {
+        uint8_t *tmp = g_malloc(w * h * 4);
+        glReadPixels(x, y, w, h,
+                     GL_RGBA, GL_UNSIGNED_BYTE, tmp);
+
+        int dst_stride = surface_stride(dst);
+        uint8_t *dst_data = (uint8_t *)surface_data(dst);
+        for (int row = 0; row < h; row++) {
+            uint32_t *sp = (uint32_t *)(tmp + row * w * 4);
+            uint32_t *dp = (uint32_t *)(dst_data + (y + row) * dst_stride + x * 4);
+            for (int col = 0; col < w; col++) {
+                uint32_t p = sp[col];
+                dp[col] = ((p & 0x00FF0000) >> 16) |
+                           (p & 0xFF00FF00)         |
+                          ((p & 0x000000FF) << 16);
+            }
+        }
+        g_free(tmp);
+    }
+#endif
 }
 
 void egl_texture_blit(QemuGLShader *gls, egl_fb *dst, egl_fb *src, bool flip)
 {
     glBindFramebuffer(GL_FRAMEBUFFER_EXT, dst->framebuffer);
     glViewport(0, 0, dst->width, dst->height);
-    glEnable(GL_TEXTURE_2D);
+#ifndef __ANDROID__
+    glEnable(GL_TEXTURE_2D);  /* fixed-function, not valid in GLES */
+#endif
     glBindTexture(GL_TEXTURE_2D, src->texture);
     qemu_gl_run_texture_blit(gls, flip);
 }
@@ -206,7 +277,9 @@ void egl_texture_blend(QemuGLShader *gls, egl_fb *dst, egl_fb *src, bool flip,
     } else {
         glViewport(x, dst->height - h - y, w, h);
     }
-    glEnable(GL_TEXTURE_2D);
+#ifndef __ANDROID__
+    glEnable(GL_TEXTURE_2D);  /* fixed-function, not valid in GLES */
+#endif
     glBindTexture(GL_TEXTURE_2D, src->texture);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -630,7 +703,7 @@ EGLContext qemu_egl_init_ctx(void)
         EGL_NONE
     };
     static const EGLint ctx_att_gles[] = {
-        EGL_CONTEXT_CLIENT_VERSION, 2,
+        EGL_CONTEXT_CLIENT_VERSION, 3,
         EGL_NONE
     };
     bool gles = (qemu_egl_mode == DISPLAY_GL_MODE_ES);
