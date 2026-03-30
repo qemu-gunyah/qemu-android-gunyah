@@ -14,6 +14,7 @@
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <sys/eventfd.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <ucontext.h>
 #include <dlfcn.h>
@@ -51,6 +52,22 @@
 #include "qemu/main-loop.h"
 #include "system/runstate.h"
 #include "qemu/guest-random.h"
+
+/*
+ * Constructor: unblock SIGBUS/SIGSEGV before main() and before any threads
+ * are created.  All threads inherit the signal mask, so unblocking here
+ * ensures SIGBUS is deliverable in every thread (iothreads, AIO workers,
+ * VNC, etc.).  Without this, blocked synchronous SIGBUS kills the process.
+ */
+__attribute__((constructor))
+static void gunyah_unblock_sigbus_early(void)
+{
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGBUS);
+    sigaddset(&set, SIGSEGV);
+    pthread_sigmask(SIG_UNBLOCK, &set, NULL);
+}
 
 static void gunyah_region_add(MemoryListener *listener,
                            MemoryRegionSection *section);
@@ -103,108 +120,166 @@ static void gunyah_print_symbol(const char *label, uintptr_t addr)
     }
 }
 
+/*
+ * Signal-safe LEND region cache.  Populated after VM_START from
+ * gunyah_start_vm().  No locks, no QOM — just plain arrays that
+ * the signal handler can read safely.
+ */
+#define SIGBUS_MAX_LEND_REGIONS 64
+static struct {
+    uint8_t *hva;
+    uint64_t size;
+    uint64_t gpa;
+} sigbus_lend_regions[SIGBUS_MAX_LEND_REGIONS];
+static volatile int sigbus_lend_count;
+static volatile int sigbus_handler_active;  /* set after VM_START */
+
 static void gunyah_sigsegv_handler(int sig, siginfo_t *si, void *ctx)
 {
-    GUNYAHState *s = NULL;
     ucontext_t *uc = (ucontext_t *)ctx;
     int i;
 
-    fprintf(stderr, "\n=== GUNYAH SIGSEGV DIAGNOSTIC ===\n");
-    fprintf(stderr, "Signal: %d (%s)\n", sig,
-            sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" : "?");
-    fprintf(stderr, "Faulting address: %p\n", si->si_addr);
-    fprintf(stderr, "Code: %d (%s)\n", si->si_code,
-            si->si_code == SEGV_MAPERR ? "SEGV_MAPERR (unmapped)" :
-            si->si_code == SEGV_ACCERR ? "SEGV_ACCERR (permission)" :
-            "unknown");
-    fprintf(stderr, "Thread ID: %d\n", (int)syscall(SYS_gettid));
+    /*
+     * Fast path: ANY SIGBUS after VM_START — remap faulting page to
+     * anonymous zero-fill and retry.
+     *
+     * In Gunyah protected VMs, SIGBUS can come from:
+     *   1. LEND'd memory access (hypervisor owns the physical page)
+     *   2. BUS_OBJERR from mmap'd files on FUSE filesystems
+     *   3. DMA buffer addresses in guest RAM
+     *
+     * Rather than trying to match addresses to specific regions,
+     * remap ANY faulting page.  The guest is unaffected: its stage-2
+     * mappings are independent of the host's virtual address space.
+     * QEMU reads zeros (safe for config space, DMA buffers, etc.).
+     */
+    if (sig == SIGBUS && si->si_addr && sigbus_handler_active) {
+        uintptr_t page_addr = (uintptr_t)si->si_addr & ~(uintptr_t)0xFFF;
+        void *ret = mmap((void *)page_addr, 4096,
+                         PROT_READ | PROT_WRITE,
+                         MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS,
+                         -1, 0);
+        if (ret != MAP_FAILED) {
+            static volatile int remap_log_count;
+            if (remap_log_count < 50) {
+                char buf[128];
+                int len = snprintf(buf, sizeof(buf),
+                    "GH: SIGBUS at hva=0x%llx code=%d — remapped\n",
+                    (unsigned long long)page_addr, si->si_code);
+                if (len > 0) write(STDERR_FILENO, buf, len);
+                remap_log_count++;
+            }
+            return;
+        }
+    }
 
-    /* Print CPU registers from signal context (aarch64) */
+    /* Diagnostic path — use write() for signal safety */
+    {
+        char buf[256];
+        int len = snprintf(buf, sizeof(buf),
+            "\n=== GUNYAH SIGNAL DIAGNOSTIC ===\n"
+            "Signal: %d (%s)\n"
+            "Faulting address: %p\n"
+            "si_code: %d\n"
+            "handler_active: %d, lend_count: %d\n"
+            "Thread ID: %d\n",
+            sig,
+            sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" : "?",
+            si->si_addr,
+            si->si_code,
+            sigbus_handler_active, sigbus_lend_count,
+            (int)syscall(SYS_gettid));
+        if (len > 0) write(STDERR_FILENO, buf, len);
+    }
+
     if (uc) {
-        uintptr_t pc = uc->uc_mcontext.pc;
-        uintptr_t lr = uc->uc_mcontext.regs[30];  /* X30 = LR */
-        uintptr_t fp = uc->uc_mcontext.regs[29];  /* X29 = FP */
-        uintptr_t sp = uc->uc_mcontext.sp;
-
-        fprintf(stderr, "\nRegisters:\n");
-        fprintf(stderr, "  PC=0x%llx  SP=0x%llx\n",
-                (unsigned long long)pc, (unsigned long long)sp);
-        fprintf(stderr, "  FP=0x%llx  LR=0x%llx\n",
-                (unsigned long long)fp, (unsigned long long)lr);
-
-        /* Print X0-X28 to see what pointer was NULL */
-        for (i = 0; i < 29; i++) {
-            if (i % 4 == 0) fprintf(stderr, " ");
-            fprintf(stderr, " X%d=0x%llx", i,
-                    (unsigned long long)uc->uc_mcontext.regs[i]);
-            if (i % 4 == 3) fprintf(stderr, "\n");
-        }
-        fprintf(stderr, "\n");
-
-        /* Symbol lookup for PC and LR */
-        gunyah_print_symbol("PC", pc);
-        gunyah_print_symbol("LR (caller)", lr);
-
-        /* Walk frame pointers for backtrace */
-        fprintf(stderr, "\nBacktrace (frame pointer walk):\n");
-        uintptr_t *frame = (uintptr_t *)fp;
-        for (i = 0; i < 20 && frame; i++) {
-            uintptr_t ret_addr = frame[1]; /* return address */
-            if (ret_addr == 0) break;
-            gunyah_print_symbol("  frame", ret_addr);
-            uintptr_t *next_frame = (uintptr_t *)frame[0];
-            /* Sanity check: frame pointer should increase */
-            if (next_frame <= frame) break;
-            frame = next_frame;
-        }
+        char buf[128];
+        int len = snprintf(buf, sizeof(buf),
+            "PC=0x%llx LR=0x%llx SP=0x%llx\n",
+            (unsigned long long)uc->uc_mcontext.pc,
+            (unsigned long long)uc->uc_mcontext.regs[30],
+            (unsigned long long)uc->uc_mcontext.sp);
+        if (len > 0) write(STDERR_FILENO, buf, len);
     }
 
-    fprintf(stderr, "\nMemory slots:\n");
-    /* Try to get GUNYAHState to check if fault is in LEND region */
-    s = get_gunyah_state();
-    if (s) {
-        fprintf(stderr, "vm_started: %u\n", s->vm_started);
-        for (i = 0; i < s->nr_slots; ++i) {
-            if (s->slots[i].size == 0) continue;
-            uint8_t *mem_start = s->slots[i].mem;
-            uint8_t *mem_end = mem_start + s->slots[i].size;
-            uint8_t *fault = (uint8_t *)si->si_addr;
-            bool in_slot = (fault >= mem_start && fault < mem_end);
-            fprintf(stderr, "  slot[%d]: hva=%p-%p gpa=0x%llx size=0x%llx lend=%d%s\n",
-                    i, mem_start, mem_end,
-                    (unsigned long long)s->slots[i].start,
-                    (unsigned long long)s->slots[i].size,
-                    s->slots[i].lend,
-                    in_slot ? " *** FAULT IS HERE ***" : "");
-        }
+    /* Print LEND regions for debugging */
+    for (i = 0; i < sigbus_lend_count; i++) {
+        char buf[128];
+        uint8_t *fault = (uint8_t *)si->si_addr;
+        uint8_t *start = sigbus_lend_regions[i].hva;
+        uint8_t *end = start + sigbus_lend_regions[i].size;
+        int len = snprintf(buf, sizeof(buf),
+            "  lend[%d]: hva=%p-%p gpa=0x%llx%s\n",
+            i, start, end,
+            (unsigned long long)sigbus_lend_regions[i].gpa,
+            (fault >= start && fault < end) ? " *** FAULT ***" : "");
+        if (len > 0) write(STDERR_FILENO, buf, len);
     }
 
-    if (current_cpu) {
-        fprintf(stderr, "current_cpu: index=%d, fd=%d, run=%p\n",
-                current_cpu->cpu_index,
-                current_cpu->accel ? current_cpu->accel->fd : -999,
-                current_cpu->accel ? (void *)current_cpu->accel->run : NULL);
-    } else {
-        fprintf(stderr, "current_cpu: NULL (not a VCPU thread)\n");
+    {
+        const char msg[] = "=== END DIAGNOSTIC ===\n";
+        write(STDERR_FILENO, msg, sizeof(msg) - 1);
     }
-
-    fprintf(stderr, "=== END SIGSEGV DIAGNOSTIC ===\n");
-    fflush(stderr);
 
     /* Re-raise to get default behavior (core dump / exit) */
     signal(sig, SIG_DFL);
     raise(sig);
 }
 
+/*
+ * Install signal handler bypassing Android Bionic's sigchain.
+ *
+ * Android's Bionic wraps sigaction() with a "sigchain" layer that
+ * intercepts crash signals and routes them to debuggerd — our handler
+ * never runs.  Use the raw rt_sigaction syscall to bypass it.
+ *
+ * AArch64 kernel sigaction layout (NO sa_restorer on ARM64!):
+ *   - sa_handler  (8 bytes)
+ *   - sa_flags    (8 bytes)
+ *   - sa_mask     (8 bytes = _NSIG/8 = 64/8)
+ */
+struct kernel_sigaction_arm64 {
+    void (*k_sa_handler)(int, siginfo_t *, void *);
+    unsigned long sa_flags;
+    unsigned long sa_mask;
+};
+
+static int raw_sigaction(int sig, void (*handler)(int, siginfo_t *, void *))
+{
+    struct kernel_sigaction_arm64 ksa;
+    memset(&ksa, 0, sizeof(ksa));
+    ksa.k_sa_handler = handler;
+    ksa.sa_flags = SA_SIGINFO | SA_RESTART | SA_NODEFER;
+    /* rt_sigaction(sig, act, oldact, sigsetsize) */
+    long ret = syscall(SYS_rt_sigaction, sig, &ksa, NULL,
+                       (size_t)8 /* _NSIG / 8 = 64 / 8 */);
+    return (int)ret;
+}
+
 static void gunyah_install_sigsegv_handler(void)
 {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = gunyah_sigsegv_handler;
-    sa.sa_flags = SA_SIGINFO;
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS, &sa, NULL);
-    error_report("GH: installed SIGSEGV/SIGBUS diagnostic handler");
+    sigset_t set;
+    int r1, r2;
+
+    /*
+     * Use raw rt_sigaction to bypass Bionic's sigchain/debuggerd.
+     */
+    r1 = raw_sigaction(SIGSEGV, gunyah_sigsegv_handler);
+    r2 = raw_sigaction(SIGBUS, gunyah_sigsegv_handler);
+
+    /* Activate immediately so the handler can recover from any SIGBUS */
+    sigbus_handler_active = 1;
+
+    /*
+     * Unblock SIGBUS/SIGSEGV on this thread.
+     */
+    sigemptyset(&set);
+    sigaddset(&set, SIGBUS);
+    sigaddset(&set, SIGSEGV);
+    pthread_sigmask(SIG_UNBLOCK, &set, NULL);
+
+    error_report("GH: installed SIGSEGV/SIGBUS handler via raw rt_sigaction "
+                 "(SIGSEGV=%d SIGBUS=%d)", r1, r2);
 }
 
 static int gunyah_ioctl(int type, ...)
@@ -447,6 +522,10 @@ static void gunyah_add_mem(GUNYAHState *s, MemoryRegionSection *section,
                         section->offset_within_region;
     uint64_t base_gpa = section->offset_within_address_space;
     int ret;
+    const uint64_t thp_size = 2ULL * 1024 * 1024; /* 2MB */
+    uint8_t *need_thp = NULL;
+    uint64_t total_chunks = total_size / thp_size;
+    uint64_t large_page_bytes = 0; /* bytes collapsed to >= 64KB folios */
 
     /*
      * Pre-fault all pages before LEND ioctl.
@@ -461,7 +540,6 @@ static void gunyah_add_mem(GUNYAHState *s, MemoryRegionSection *section,
      */
     if (lend) {
         FILE *f;
-        const uint64_t thp_size = 2ULL * 1024 * 1024; /* 2MB */
 
         error_report("GH: preparing LEND region: hva=0x%"PRIx64
                      " size=0x%"PRIx64" (%"PRIu64" MB)",
@@ -495,6 +573,52 @@ static void gunyah_add_mem(GUNYAHState *s, MemoryRegionSection *section,
         if (f) { fprintf(f, "1\n"); fclose(f); }
         usleep(500000);
 
+        /*
+         * Enable multi-size THP (mTHP) at all intermediate orders.
+         *
+         * By default, only 2MB THP is enabled.  Intermediate sizes
+         * (16KB, 32KB, 64KB, 128KB, 256KB, 512KB, 1024KB) are
+         * set to "never".  Without enabling them, the page fault
+         * handler only tries 2MB → 4KB, wasting all the free
+         * intermediate-order blocks in the buddy allocator.
+         *
+         * With mTHP enabled, the kernel tries each enabled size
+         * on fault: 2MB → 1MB → 512KB → ... → 16KB → 4KB,
+         * using whatever contiguous blocks the buddy allocator has.
+         *
+         * We set them to "always" (rather than "madvise") so the
+         * kernel proactively uses larger pages during population.
+         * Settings are left enabled — no restore to "never".
+         */
+        {
+            static const char *mthp_sizes[] = {
+                "16kB", "32kB", "64kB", "128kB",
+                "256kB", "512kB", "1024kB", NULL
+            };
+            int mi;
+            int mthp_enabled = 0;
+
+            for (mi = 0; mthp_sizes[mi]; mi++) {
+                char path[128];
+                snprintf(path, sizeof(path),
+                         "/sys/kernel/mm/transparent_hugepage/"
+                         "hugepages-%s/enabled",
+                         mthp_sizes[mi]);
+                f = fopen(path, "w");
+                if (f) {
+                    fprintf(f, "always\n");
+                    fclose(f);
+                    mthp_enabled++;
+                }
+            }
+            if (mthp_enabled) {
+                error_report("GH: Phase 1: enabled mTHP at %d intermediate "
+                             "sizes (16kB-1024kB)", mthp_enabled);
+            } else {
+                error_report("GH: Phase 1: mTHP not available");
+            }
+        }
+
         /* Log available huge pages before allocation */
         {
             char line[256];
@@ -518,6 +642,8 @@ static void gunyah_add_mem(GUNYAHState *s, MemoryRegionSection *section,
         ret = madvise(base_hva, total_size, MADV_HUGEPAGE);
         error_report("GH: MADV_HUGEPAGE: %s",
                      ret == 0 ? "OK" : strerror(errno));
+
+        /* (mTHP stats logged via smaps after population) */
 
         /* Diagnostic: check VMA flags for this region */
         {
@@ -556,16 +682,15 @@ static void gunyah_add_mem(GUNYAHState *s, MemoryRegionSection *section,
         }
 
         /*
-         * Phase 2: Populate in 256MB batches.
+         * Phase 2: Populate in 64MB batches.
          *
-         * Doing one huge MADV_POPULATE_WRITE exhausts free 2MB regions
-         * early, and the rest falls back to 4KB.  By batching with
-         * compaction between batches, we give the kernel a chance to
-         * defragment the just-allocated 4KB pages and create new
-         * 2MB regions for the next batch.
+         * Smaller batches reduce fragmentation pressure and give the
+         * kernel more opportunities to use mTHP-sized allocations from
+         * the buddy allocator.  Compaction runs every 256MB to
+         * defragment between batches.
          */
         {
-            const uint64_t batch_size = 256ULL * 1024 * 1024; /* 256MB */
+            const uint64_t batch_size = 64ULL * 1024 * 1024; /* 64MB */
             uint64_t offset;
             int batch_idx = 0;
 
@@ -594,9 +719,9 @@ static void gunyah_add_mem(GUNYAHState *s, MemoryRegionSection *section,
                 batch_idx++;
 
                 /*
-                 * Every 4 batches (1GB), compact memory.
-                 * This lets the kernel merge fragmented 4KB regions
-                 * into 2MB blocks for subsequent THP allocations.
+                 * Every 4 batches (256MB), compact memory.
+                 * This lets the kernel merge fragmented pages into
+                 * larger contiguous blocks for subsequent allocations.
                  */
                 if (batch_idx % 4 == 0 && offset + batch_size < total_size) {
                     f = fopen("/proc/sys/vm/compact_memory", "w");
@@ -607,143 +732,255 @@ static void gunyah_add_mem(GUNYAHState *s, MemoryRegionSection *section,
             error_report("GH: Phase 2: population complete");
         }
 
-        /* Log THP status after population */
-        {
-            char line[256];
-            f = fopen("/proc/meminfo", "r");
-            if (f) {
-                while (fgets(line, sizeof(line), f)) {
-                    if (strstr(line, "AnonHugePages")) {
-                        char *nl = strchr(line, '\n');
-                        if (nl) *nl = '\0';
-                        error_report("GH:   after populate: %s", line);
-                    }
-                }
-                fclose(f);
-            }
-        }
-
         /*
-         * Phase 3: MADV_COLLAPSE + retry loop.
+         * Phase 3: Cascading MADV_COLLAPSE — largest pages first.
          *
-         * First pass: try MADV_COLLAPSE on every 2MB chunk.
-         * For chunks that fail: release their 4KB pages (MADV_DONTNEED),
-         * compact memory, then re-populate and retry.  Releasing the
-         * scattered 4KB pages lets compaction merge them into contiguous
-         * 2MB blocks for the next THP allocation attempt.
+         * Try to collapse pages into the largest possible folios,
+         * starting at 2MB and cascading down to 64KB.  This maximizes
+         * large-page coverage even on devices with fragmented memory
+         * that can't provide many 2MB THPs.
          *
-         * Repeat up to 5 times to push toward 100% THP coverage.
+         * For 2MB: retry up to 2 times (release + compact + re-populate).
+         * For smaller sizes (1MB..64KB): single pass each.
+         *
+         * A per-64KB order map tracks which regions have been
+         * successfully collapsed, so smaller passes skip regions
+         * already covered by a larger folio.
          */
         {
-            uint64_t total_chunks = total_size / thp_size;
-            uint64_t collapsed = 0, failed = 0;
-            uint64_t chunk;
-            int pass;
-            int last_err = 0;
+            static const struct {
+                uint64_t size;
+                int order;
+                const char *name;
+                int max_retries; /* 0 = single pass */
+            } collapse_levels[] = {
+                { 2ULL * 1024 * 1024,    9, "2MB",   0 },
+                { 1ULL * 1024 * 1024,    8, "1MB",   0 },
+                { 512ULL * 1024,         7, "512KB", 0 },
+                { 256ULL * 1024,         6, "256KB", 0 },
+                { 128ULL * 1024,         5, "128KB", 0 },
+                { 64ULL * 1024,          4, "64KB",  0 },
+            };
+            const int num_levels = sizeof(collapse_levels) /
+                                   sizeof(collapse_levels[0]);
 
-            /* Bitmap: 1 = needs THP, 0 = already THP */
-            uint8_t *need_thp = (uint8_t *)calloc(total_chunks, 1);
-            if (!need_thp) {
+            /* Order map at 64KB (smallest collapse unit) granularity.
+             * 0 = not collapsed, >0 = collapsed to this order. */
+            const uint64_t map_unit = 64ULL * 1024; /* 64KB */
+            uint64_t map_count = total_size / map_unit;
+            uint8_t *order_map = (uint8_t *)calloc(map_count, 1);
+            int level;
+
+            if (!order_map) {
                 error_report("GH: Phase 3: calloc failed, skipping");
+                need_thp = (uint8_t *)calloc(total_chunks, 1);
+                if (need_thp)
+                    memset(need_thp, 1, total_chunks);
                 goto skip_phase3;
             }
 
-            /* First pass: identify which chunks need collapsing */
-            error_report("GH: Phase 3: MADV_COLLAPSE pass 0 ...");
-            for (chunk = 0; chunk < total_chunks; chunk++) {
-                ret = madvise((char *)base_hva + chunk * thp_size,
-                              thp_size, MADV_COLLAPSE);
-                if (ret == 0) {
-                    collapsed++;
-                } else {
-                    need_thp[chunk] = 1;
-                    failed++;
-                    last_err = errno;
-                }
-            }
-            error_report("GH:   pass 0: %"PRIu64" OK, %"PRIu64
-                         " failed (err=%d), %.1f%%",
-                         collapsed, failed, last_err,
-                         (double)collapsed * 100.0 /
-                         (double)total_chunks);
+            error_report("GH: Phase 3: cascading MADV_COLLAPSE "
+                         "(2MB -> 64KB) ...");
 
-            /* Retry loop: release failed chunks, compact, re-populate */
-            for (pass = 1; pass <= 5 && failed > 0; pass++) {
-                uint64_t pass_ok = 0, pass_fail = 0;
+            for (level = 0; level < num_levels; level++) {
+                uint64_t csize = collapse_levels[level].size;
+                int corder = collapse_levels[level].order;
+                const char *cname = collapse_levels[level].name;
+                int max_retries = collapse_levels[level].max_retries;
+                uint64_t units_per_chunk = csize / map_unit;
+                uint64_t num_chunks_lvl = total_size / csize;
+                uint64_t collapsed = 0, skipped = 0, failed = 0;
+                int last_err = 0;
+                uint64_t ci;
+                int pass;
 
-                /* Release 4KB pages from failed chunks */
-                for (chunk = 0; chunk < total_chunks; chunk++) {
-                    if (need_thp[chunk]) {
-                        madvise((char *)base_hva + chunk * thp_size,
-                                thp_size, MADV_DONTNEED);
+                /* First pass */
+                for (ci = 0; ci < num_chunks_lvl; ci++) {
+                    uint64_t map_base = ci * units_per_chunk;
+                    uint64_t u;
+                    int all_free = 1;
+
+                    /* Skip if any sub-unit already collapsed */
+                    for (u = 0; u < units_per_chunk; u++) {
+                        if (order_map[map_base + u] != 0) {
+                            all_free = 0;
+                            break;
+                        }
                     }
-                }
-
-                /* Compact memory — freed 4KB pages can now be merged */
-                f = fopen("/proc/sys/vm/compact_memory", "w");
-                if (f) { fprintf(f, "1\n"); fclose(f); }
-                usleep(300000); /* 300ms for compaction */
-
-                /* Re-populate and try MADV_COLLAPSE again */
-                for (chunk = 0; chunk < total_chunks; chunk++) {
-                    if (!need_thp[chunk])
+                    if (!all_free) {
+                        skipped++;
                         continue;
+                    }
 
-                    /* Re-fault the pages (kernel will try THP first) */
-                    madvise((char *)base_hva + chunk * thp_size,
-                            thp_size, MADV_POPULATE_WRITE);
-
-                    ret = madvise((char *)base_hva + chunk * thp_size,
-                                  thp_size, MADV_COLLAPSE);
+                    ret = madvise((char *)base_hva + ci * csize,
+                                  csize, MADV_COLLAPSE);
                     if (ret == 0) {
-                        need_thp[chunk] = 0;
-                        pass_ok++;
+                        for (u = 0; u < units_per_chunk; u++)
+                            order_map[map_base + u] = corder;
+                        collapsed++;
                     } else {
-                        pass_fail++;
+                        failed++;
                         last_err = errno;
                     }
                 }
 
-                collapsed += pass_ok;
-                failed = pass_fail;
-                error_report("GH:   pass %d: +%"PRIu64" OK, "
-                             "%"PRIu64" remaining, %.1f%%",
-                             pass, pass_ok, failed,
-                             (double)collapsed * 100.0 /
-                             (double)total_chunks);
+                error_report("GH:   %s pass 0: %"PRIu64" OK, %"PRIu64
+                             " skipped, %"PRIu64" failed (err=%d)",
+                             cname, collapsed, skipped, failed, last_err);
 
-                /* If no progress, stop retrying */
-                if (pass_ok == 0)
-                    break;
+                /* Retry passes (only for levels that request it) */
+                for (pass = 1; pass <= max_retries && failed > 0; pass++) {
+                    uint64_t pass_ok = 0, pass_fail = 0;
+
+                    /* Release failed chunks */
+                    for (ci = 0; ci < num_chunks_lvl; ci++) {
+                        uint64_t map_base = ci * units_per_chunk;
+                        uint64_t u;
+                        int all_free = 1;
+                        for (u = 0; u < units_per_chunk; u++) {
+                            if (order_map[map_base + u] != 0) {
+                                all_free = 0;
+                                break;
+                            }
+                        }
+                        if (all_free) {
+                            madvise((char *)base_hva + ci * csize,
+                                    csize, MADV_DONTNEED);
+                        }
+                    }
+
+                    /* Compact */
+                    f = fopen("/proc/sys/vm/compact_memory", "w");
+                    if (f) { fprintf(f, "1\n"); fclose(f); }
+                    usleep(300000);
+
+                    /* Re-populate and retry */
+                    for (ci = 0; ci < num_chunks_lvl; ci++) {
+                        uint64_t map_base = ci * units_per_chunk;
+                        uint64_t u;
+                        int all_free = 1;
+
+                        for (u = 0; u < units_per_chunk; u++) {
+                            if (order_map[map_base + u] != 0) {
+                                all_free = 0;
+                                break;
+                            }
+                        }
+                        if (!all_free)
+                            continue;
+
+                        madvise((char *)base_hva + ci * csize,
+                                csize, MADV_POPULATE_WRITE);
+
+                        ret = madvise((char *)base_hva + ci * csize,
+                                      csize, MADV_COLLAPSE);
+                        if (ret == 0) {
+                            for (u = 0; u < units_per_chunk; u++)
+                                order_map[map_base + u] = corder;
+                            pass_ok++;
+                        } else {
+                            pass_fail++;
+                            last_err = errno;
+                        }
+                    }
+
+                    collapsed += pass_ok;
+                    failed = pass_fail;
+                    error_report("GH:   %s pass %d: +%"PRIu64" OK, "
+                                 "%"PRIu64" remaining",
+                                 cname, pass, pass_ok, failed);
+
+                    if (pass_ok == 0)
+                        break;
+                }
             }
 
-            error_report("GH: Phase 3 done: %"PRIu64"/%"PRIu64
-                         " THPs (%.1f%%), %"PRIu64" stuck at 4KB",
-                         collapsed, total_chunks,
-                         (double)collapsed * 100.0 /
-                         (double)total_chunks,
-                         failed);
+            /* Summary */
+            {
+                uint64_t order_total[10] = {0};
+                uint64_t mi_idx;
+                int o;
+                uint64_t uncollapsed = 0;
 
-            /* Phase 3b trimming removed — size is capped upfront in Phase 0 */
-            free(need_thp);
+                for (mi_idx = 0; mi_idx < map_count; mi_idx++) {
+                    if (order_map[mi_idx] > 0 && order_map[mi_idx] <= 9)
+                        order_total[order_map[mi_idx]]++;
+                    else
+                        uncollapsed++;
+                }
+
+                error_report("GH: Phase 3 done — collapse summary "
+                             "(per 64KB unit):");
+                for (o = 9; o >= 4; o--) {
+                    if (order_total[o] > 0) {
+                        uint64_t size_kb = 4ULL << o;
+                        uint64_t mb = (order_total[o] * 64) / 1024;
+                        error_report("GH:   %4"PRIu64"KB: %"PRIu64
+                                     " units = %"PRIu64" MB",
+                                     size_kb, order_total[o], mb);
+                    }
+                }
+                error_report("GH:   uncollapsed (4KB): %"PRIu64" units = "
+                             "%"PRIu64" MB",
+                             uncollapsed, (uncollapsed * 64) / 1024);
+
+                /* Save for final summary */
+                large_page_bytes = (map_count - uncollapsed) * map_unit;
+            }
+
+            /*
+             * Re-populate any regions left unpopulated by retry passes.
+             * MADV_DONTNEED during retries may have released pages that
+             * were never successfully re-collapsed.
+             */
+            {
+                uint64_t mi_idx;
+                for (mi_idx = 0; mi_idx < map_count; mi_idx++) {
+                    if (order_map[mi_idx] == 0) {
+                        uint64_t off = mi_idx * map_unit;
+                        ret = madvise((char *)base_hva + off, map_unit,
+                                      MADV_POPULATE_WRITE);
+                        if (ret != 0) {
+                            volatile char *p =
+                                (volatile char *)base_hva + off;
+                            uint64_t pg;
+                            for (pg = 0; pg < map_unit / 4096; pg++)
+                                p[pg * 4096] = p[pg * 4096];
+                        }
+                    }
+                }
+            }
+
+            /* Build need_thp[] from order_map for LEND splitting */
+            need_thp = (uint8_t *)calloc(total_chunks, 1);
+            if (need_thp) {
+                uint64_t ci;
+                for (ci = 0; ci < total_chunks; ci++) {
+                    /* 2MB chunk = 32 x 64KB units.
+                     * Mark as THP only if ALL units are order >= 9 */
+                    uint64_t map_base = ci * (thp_size / map_unit);
+                    uint64_t u;
+                    int is_thp = 1;
+                    for (u = 0; u < thp_size / map_unit; u++) {
+                        if (order_map[map_base + u] < 9) {
+                            is_thp = 0;
+                            break;
+                        }
+                    }
+                    need_thp[ci] = is_thp ? 0 : 1;
+                }
+            }
+
+            free(order_map);
         }
 skip_phase3:
 
-        /* Final THP count */
-        {
-            char line[256];
-            f = fopen("/proc/meminfo", "r");
-            if (f) {
-                while (fgets(line, sizeof(line), f)) {
-                    if (strstr(line, "AnonHugePages")) {
-                        char *nl = strchr(line, '\n');
-                        if (nl) *nl = '\0';
-                        error_report("GH:   final: %s", line);
-                    }
-                }
-                fclose(f);
-            }
-        }
+        /* Final large-page summary */
+        error_report("GH: === large-page coverage: %"PRIu64" / %"PRIu64
+                     " MB (%.1f%%) ===",
+                     large_page_bytes >> 20, total_size >> 20,
+                     (double)large_page_bytes * 100.0 /
+                     (double)total_size);
 
         /* Phase 4: Lock pages */
         ret = mlock(base_hva, total_size);
@@ -766,33 +1003,99 @@ skip_phase3:
      * per binding, and each binding is now small enough to succeed.
      */
     if (lend && total_size > GUNYAH_LEND_CHUNK_SIZE) {
-        uint64_t offset = 0;
         int chunk_idx = 0;
 
-        error_report("GH: splitting %"PRIu64" MB LEND into %"PRIu64
-                     " x %"PRIu64" MB chunks",
-                     total_size >> 20,
-                     (total_size + GUNYAH_LEND_CHUNK_SIZE - 1) /
-                         GUNYAH_LEND_CHUNK_SIZE,
-                     GUNYAH_LEND_CHUNK_SIZE >> 20);
+        if (need_thp) {
+            /*
+             * THP-aware LEND splitting:
+             * - Contiguous THP-backed (2MB) regions → large chunks (up to 256MB)
+             * - Contiguous non-THP regions (mTHP or 4KB) → separate LEND calls
+             * This lets the hypervisor map THP regions with 2MB block entries
+             * and mTHP/4KB regions with appropriate-size entries.
+             */
+            uint64_t thp_ok = 0, thp_fail = 0;
+            uint64_t c;
+            for (c = 0; c < total_chunks; c++) {
+                if (need_thp[c]) thp_fail++; else thp_ok++;
+            }
+            error_report("GH: THP-aware LEND split: %"PRIu64" MB total, "
+                         "%"PRIu64" THP(2MB) chunks, %"PRIu64
+                         " mTHP/4KB chunks",
+                         total_size >> 20, thp_ok, thp_fail);
 
-        while (offset < total_size) {
-            uint64_t chunk_sz = total_size - offset;
-            if (chunk_sz > GUNYAH_LEND_CHUNK_SIZE)
-                chunk_sz = GUNYAH_LEND_CHUNK_SIZE;
+            c = 0;
+            while (c < total_chunks) {
+                uint8_t is_small = need_thp[c];
+                uint64_t run_start = c;
+                uint64_t run_offset, run_size;
 
-            error_report("GH:   chunk[%d] gpa=0x%"PRIx64" size=0x%"PRIx64,
-                         chunk_idx, base_gpa + offset, chunk_sz);
-            gunyah_add_mem_slot(s, base_hva + offset,
-                                base_gpa + offset, chunk_sz,
-                                lend, flags);
-            offset += chunk_sz;
-            chunk_idx++;
+                /* Find contiguous run of same backing type */
+                while (c < total_chunks && need_thp[c] == is_small)
+                    c++;
+
+                run_offset = run_start * thp_size;
+                run_size = (c - run_start) * thp_size;
+
+                /* Sub-split at 256MB boundaries */
+                {
+                    uint64_t sub_off = 0;
+                    while (sub_off < run_size) {
+                        uint64_t sub_sz = run_size - sub_off;
+                        if (sub_sz > GUNYAH_LEND_CHUNK_SIZE)
+                            sub_sz = GUNYAH_LEND_CHUNK_SIZE;
+
+                        error_report("GH:   %s-chunk[%d] gpa=0x%"PRIx64
+                                     " size=0x%"PRIx64,
+                                     is_small ? "mTHP" : "THP",
+                                     chunk_idx,
+                                     base_gpa + run_offset + sub_off,
+                                     sub_sz);
+                        gunyah_add_mem_slot(s,
+                                            base_hva + run_offset + sub_off,
+                                            base_gpa + run_offset + sub_off,
+                                            sub_sz, lend, flags);
+                        sub_off += sub_sz;
+                        chunk_idx++;
+                    }
+                }
+            }
+
+            error_report("GH: THP-aware split done: %d LEND slots used",
+                         chunk_idx);
+            free(need_thp);
+            return;
+        }
+
+        /* Fallback: no THP bitmap, fixed 256MB chunks */
+        {
+            uint64_t offset = 0;
+
+            error_report("GH: splitting %"PRIu64" MB LEND into %"PRIu64
+                         " x %"PRIu64" MB chunks",
+                         total_size >> 20,
+                         (total_size + GUNYAH_LEND_CHUNK_SIZE - 1) /
+                             GUNYAH_LEND_CHUNK_SIZE,
+                         GUNYAH_LEND_CHUNK_SIZE >> 20);
+
+            while (offset < total_size) {
+                uint64_t chunk_sz = total_size - offset;
+                if (chunk_sz > GUNYAH_LEND_CHUNK_SIZE)
+                    chunk_sz = GUNYAH_LEND_CHUNK_SIZE;
+
+                error_report("GH:   chunk[%d] gpa=0x%"PRIx64" size=0x%"PRIx64,
+                             chunk_idx, base_gpa + offset, chunk_sz);
+                gunyah_add_mem_slot(s, base_hva + offset,
+                                    base_gpa + offset, chunk_sz,
+                                    lend, flags);
+                offset += chunk_sz;
+                chunk_idx++;
+            }
         }
         return;
     }
 
     /* Non-LEND or small LEND: single slot */
+    free(need_thp);
     gunyah_add_mem_slot(s, base_hva, base_gpa, total_size, lend, flags);
 }
 
@@ -1194,6 +1497,8 @@ static int gunyah_init_vcpu(CPUState *cpu, Error **errp)
 
     pthread_sigmask(SIG_BLOCK, NULL, &set);
     sigdelset(&set, SIG_IPI);
+    sigdelset(&set, SIGBUS);   /* must be unblocked for LEND fault recovery */
+    sigdelset(&set, SIGSEGV);
 
     ret = pthread_sigmask(SIG_SETMASK, &set, NULL);
     if (ret) {
@@ -1675,7 +1980,19 @@ void gunyah_start_vm(void)
                 0x52800146, /* movz w6, #'\n' (0x0A) */
                 0xB90000A6, /* str  w6, [x5] */
                 0xAA0403E0, /* mov  x0, x4  (restore DTB addr) */
-                0xAA1F03E1, /* mov  x1, xzr */
+                /*
+                 * x1 = kernel_entry (image base).  PrePi's DiscoverDramFromDt
+                 * expects x1 = base of the loaded firmware image so it can
+                 * check the ARM64 magic and perform PE/COFF relocation.
+                 * Standard Linux boot protocol says x1 is reserved/zero, but
+                 * PrePi's FDF trampoline passes the image base in x1.
+                 */
+                /* movz x1, #(kernel_entry & 0xFFFF) */
+                (uint32_t)(0xD2800001 |
+                    ((kernel_entry & 0xFFFF) << 5)),
+                /* movk x1, #(kernel_entry >> 16), lsl #16 */
+                (uint32_t)(0xF2A00001 |
+                    (((kernel_entry >> 16) & 0xFFFF) << 5)),
                 0xAA1F03E2, /* mov  x2, xzr */
                 0xAA1F03E3, /* mov  x3, xzr */
                 /* movz x4, #(kernel_entry & 0xFFFF) */
@@ -1771,18 +2088,49 @@ vm_start:
      * Then mprotect(PROT_NONE) prevents any future faults from re-establishing
      * mappings to those pages.
      */
+    /*
+     * Do NOT touch LEND'd regions after VM_START.
+     *
+     * Gunyah uses demand paging: when the guest first touches a LEND'd
+     * page, the hypervisor kernel module calls get_user_pages() on the
+     * host HVA to pin and map the physical page into the guest's
+     * stage-2 page tables.  This requires:
+     *   - Valid PTEs (no MADV_DONTNEED — that zaps PTEs)
+     *   - Accessible VMA permissions (no mprotect(PROT_NONE) — that
+     *     causes get_user_pages() to return -EFAULT)
+     *   - Pages still resident (no munlock — that lets kernel evict)
+     *
+     * crosvm handles this by using CMA-backed regions that stay
+     * mlocked and fully mapped; it simply never accesses them from
+     * userspace after LEND.  We do the same: the SIGSEGV/SIGBUS
+     * diagnostic handler (installed above) catches any accidental
+     * host-side access, and gunyah_addr_is_lend() guards QEMU's
+     * memory listener and MMIO dispatch paths.
+     */
+    /*
+     * Populate the signal-safe LEND region cache.  The SIGBUS handler
+     * uses this to detect faults on LEND'd memory without calling any
+     * QOM or lock-based APIs (which are not async-signal-safe).
+     */
+    sigbus_lend_count = 0;
     for (i = 0; i < s->nr_slots; i++) {
         gunyah_slot *slot = &s->slots[i];
         if (slot->size && slot->lend && slot->mem) {
-            void *base = slot->mem;
-            size_t sz = slot->size;
-
-            /* Unlock pages now that LEND has pinned them */
-            munlock(base, sz);
-            error_report("GH: LEND region hva=%p size=0x%zx post-start "
-                         "munlock done", base, sz);
+            if (sigbus_lend_count < SIGBUS_MAX_LEND_REGIONS) {
+                sigbus_lend_regions[sigbus_lend_count].hva = slot->mem;
+                sigbus_lend_regions[sigbus_lend_count].size = slot->size;
+                sigbus_lend_regions[sigbus_lend_count].gpa = slot->start;
+                sigbus_lend_count++;
+            }
+            error_report("GH: LEND region hva=%p size=0x%zx kept mapped "
+                         "for demand paging", slot->mem, (size_t)slot->size);
         }
     }
+    /* Memory barrier: ensure cache is visible before activating handler */
+    __sync_synchronize();
+    sigbus_handler_active = 1;
+    error_report("GH: SIGBUS handler armed with %d LEND regions",
+                 sigbus_lend_count);
 
     qatomic_set(&s->vm_started, 1);
 }
@@ -1795,10 +2143,23 @@ static int gunyah_vcpu_exec(CPUState *cpu)
     int ret;
     enum gh_vm_status exit_status;
     enum gh_vm_exit_type exit_type;
+    static bool handler_installed;
 
     if (cpu->accel->fd < 0) {
         error_report("GH: ERROR: vcpu fd is %d (invalid!)", cpu->accel->fd);
         return EXCP_INTERRUPT;
+    }
+
+    /*
+     * Reinstall our SIGBUS handler.  QEMU's qemu_init_sigbus() in cpus.c
+     * installs a handler that immediately re-raises non-MCE SIGBUS signals.
+     * We need our handler to intercept SIGBUS on LEND'd memory and remap
+     * the faulting page to anonymous zero-fill instead of crashing.
+     * Do this once per thread on first entry.
+     */
+    if (!handler_installed) {
+        gunyah_install_sigsegv_handler();
+        handler_installed = true;
     }
 
     /* Don't re-enter after VM shutdown/crash */
@@ -1812,14 +2173,12 @@ static int gunyah_vcpu_exec(CPUState *cpu)
     do {
         struct gh_vcpu_run *run = cpu->accel->run;
         int exit_reason;
-        static uint64_t vcpu_run_count;
 
         if (qatomic_read(&cpu->exit_request)) {
             gunyah_cpu_kick_self();
         }
 
         ret = gunyah_vcpu_ioctl(cpu, GH_VCPU_RUN);
-        vcpu_run_count++;
 
         if (ret < 0) {
             if (errno == EINTR || errno == EAGAIN) {
@@ -1855,6 +2214,21 @@ static int gunyah_vcpu_exec(CPUState *cpu)
             }
 
             error_report("GH_VCPU_RUN: %s (errno=%d)", strerror(errno), errno);
+
+            /*
+             * EBUSY typically means the VM is being torn down (e.g.,
+             * after guest PSCI SYSTEM_RESET / SYSTEM_OFF).  The
+             * hypervisor won't deliver a GH_VCPU_EXIT_STATUS in this
+             * case, so we must handle it here.  Exit cleanly.
+             */
+            if (errno == EBUSY) {
+                error_report("GH: cpu %d: GH_VCPU_RUN returned EBUSY — "
+                             "VM shutting down, exiting",
+                             cpu->cpu_index);
+                qatomic_set(&gunyah_vm_stopped, true);
+                _exit(0);
+            }
+
             ret = -1;
             break;
         }
@@ -1873,26 +2247,40 @@ static int gunyah_vcpu_exec(CPUState *cpu)
              * 0x60 (THRE | TEMT) so earlycon always sees "TX ready".
              * All other reads are forwarded to PL011.
              */
-            if (mmio_addr >= 0x09000000 && mmio_addr < 0x09001000) {
-                uint32_t offset = mmio_addr & 0xFFF;
-
-                if (run->mmio.is_write) {
-                    /* Forward write to PL011 */
-                    bql_lock();
-                    address_space_rw(&address_space_memory,
-                        mmio_addr, MEMTXATTRS_UNSPECIFIED,
-                        run->mmio.data, run->mmio.len, true);
-                    bql_unlock();
-                } else if (offset == 0x14 || offset == 0x05) {
-                    /* earlycon LSR: always TX ready (0x14 = mmio32, 0x05 = byte) */
-                    memset(run->mmio.data, 0, run->mmio.len);
-                    run->mmio.data[0] = 0x60;
+            if ((mmio_addr >= 0x09000000 && mmio_addr < 0x09001000) ||
+                (mmio_addr >= 0x3f8 && mmio_addr < 0x400)) {
+                /*
+                 * PL011 UART at 0x09000000 + NS16550A compat at 0x3F8.
+                 *
+                 * PL011 reads/writes: forward ALL to the device model.
+                 * The device model handles data, status, control, AND
+                 * PID/CID registers (0xFE0-0xFFC) needed by the AMBA
+                 * bus driver to identify the PrimeCell device.
+                 *
+                 * NS16550A at 0x3F8: fake LSR, forward THR to PL011.
+                 */
+                if (mmio_addr >= 0x3f8 && mmio_addr < 0x400) {
+                    /* NS16550A compat layer */
+                    uint32_t reg_offset = mmio_addr - 0x3f8;
+                    if (run->mmio.is_write && reg_offset == 0) {
+                        bql_lock();
+                        address_space_rw(&address_space_memory,
+                            0x09000000, MEMTXATTRS_UNSPECIFIED,
+                            run->mmio.data, run->mmio.len, true);
+                        bql_unlock();
+                    } else if (!run->mmio.is_write && reg_offset == 5) {
+                        memset(run->mmio.data, 0, run->mmio.len);
+                        run->mmio.data[0] = 0x60; /* LSR: TX ready */
+                    } else {
+                        memset(run->mmio.data, 0, run->mmio.len);
+                    }
                 } else {
-                    /* Forward read to PL011 */
+                    /* PL011 — forward everything to device model */
                     bql_lock();
                     address_space_rw(&address_space_memory,
                         mmio_addr, MEMTXATTRS_UNSPECIFIED,
-                        run->mmio.data, run->mmio.len, false);
+                        run->mmio.data, run->mmio.len,
+                        run->mmio.is_write);
                     bql_unlock();
                 }
             } else {

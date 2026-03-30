@@ -98,7 +98,16 @@ static int qemu_signal_init(Error **errp)
     sigaddset(&set, SIG_IPI);
     sigaddset(&set, SIGIO);
     sigaddset(&set, SIGALRM);
-    sigaddset(&set, SIGBUS);
+    /*
+     * Do NOT block SIGBUS.  On ARM64, synchronous external aborts (e.g.
+     * accessing memory LEND'd to Gunyah) generate SIGBUS that MUST be
+     * delivered synchronously to the signal handler.  Blocking SIGBUS
+     * causes the kernel to force_sig() → immediate process termination,
+     * bypassing all signal handlers.  The Gunyah accelerator installs a
+     * SIGBUS handler that recovers by remapping faulting LEND'd pages
+     * to anonymous zero-fill.  KVM is unaffected: its vCPU threads
+     * already unblock SIGBUS explicitly.
+     */
     /* SIGINT cannot be handled via signalfd, so that ^C can be used
      * to interrupt QEMU when it is being run under gdb.  SIGHUP and
      * SIGTERM are also handled asynchronously, even though it is not

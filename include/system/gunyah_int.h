@@ -32,7 +32,7 @@ typedef struct gunyah_slot {
     bool lend;
 } gunyah_slot;
 
-#define GUNYAH_MAX_MEM_SLOTS    128
+#define GUNYAH_MAX_MEM_SLOTS    2048
 
 struct GUNYAHState {
     AccelState parent_obj;

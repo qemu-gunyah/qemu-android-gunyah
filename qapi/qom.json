@@ -961,15 +961,16 @@
 #
 # Properties for arm-confidential-guest objects (Gunyah hypervisor).
 #
-# @swiotlb-size: size of the SHARE'd DMA bounce buffer region in
-#     bytes.  This memory is accessible by both host and guest for
+# @swiotlb-size: size of the SHARE'd DMA bounce buffer region.
+#     Accepts human-readable suffixes (e.g. 128M, 1G).
+#     This memory is accessible by both host and guest for
 #     virtio DMA.  The rest of guest RAM is LEND'd (private).
 #     (default: 0)
 #
 # Since: 10.0
 ##
 { 'struct': 'ArmConfidentialGuestProperties',
-  'data': { '*swiotlb-size': 'uint64' } }
+  'data': { '*swiotlb-size': 'size' } }
 
 ##
 # @SevGuestProperties:

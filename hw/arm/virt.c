@@ -42,6 +42,7 @@
 #include "hw/vfio/vfio-calxeda-xgmac.h"
 #include "hw/vfio/vfio-amd-xgbe.h"
 #include "hw/display/ramfb.h"
+#include "hw/char/serial-mm.h"
 #include "net/net.h"
 #include "system/device_tree.h"
 #include <libfdt.h>
@@ -2228,11 +2229,12 @@ static void virt_cpu_post_init(VirtMachineState *vms, MemoryRegion *sysmem)
  *
  * Usage:
  *   -machine virt,confidential-guest-support=prot0 \
- *   -object arm-confidential-guest,id=prot0,swiotlb-size=16777216
+ *   -object arm-confidential-guest,id=prot0,swiotlb-size=128M
  *
  * This tells QEMU to run a protected VM with the given swiotlb
- * (shared DMA buffer) size.  The swiotlb region is SHARE'd with
- * the host; the rest of guest RAM is LEND'd (private).
+ * (shared DMA buffer) size.  Accepts human-readable suffixes
+ * (e.g. 128M, 1G).  The swiotlb region is SHARE'd with the host;
+ * the rest of guest RAM is LEND'd (private).
  */
 #define TYPE_ARM_CONFIDENTIAL_GUEST "arm-confidential-guest"
 OBJECT_DECLARE_SIMPLE_TYPE(ArmConfidentialGuestState, ARM_CONFIDENTIAL_GUEST)
@@ -2243,12 +2245,38 @@ struct ArmConfidentialGuestState {
 };
 
 static void
-arm_confidential_guest_instance_init(Object *obj)
+arm_confidential_guest_get_swiotlb_size(Object *obj, Visitor *v,
+                                        const char *name, void *opaque,
+                                        Error **errp)
 {
     ArmConfidentialGuestState *acg = ARM_CONFIDENTIAL_GUEST(obj);
+    uint64_t value = acg->swiotlb_size;
 
-    object_property_add_uint64_ptr(obj, "swiotlb-size", &acg->swiotlb_size,
-                                   OBJ_PROP_FLAG_READWRITE);
+    visit_type_size(v, name, &value, errp);
+}
+
+static void
+arm_confidential_guest_set_swiotlb_size(Object *obj, Visitor *v,
+                                        const char *name, void *opaque,
+                                        Error **errp)
+{
+    ArmConfidentialGuestState *acg = ARM_CONFIDENTIAL_GUEST(obj);
+    uint64_t value;
+
+    if (!visit_type_size(v, name, &value, errp)) {
+        return;
+    }
+
+    acg->swiotlb_size = value;
+}
+
+static void
+arm_confidential_guest_instance_init(Object *obj)
+{
+    object_property_add(obj, "swiotlb-size", "size",
+                        arm_confidential_guest_get_swiotlb_size,
+                        arm_confidential_guest_set_swiotlb_size,
+                        NULL, NULL);
 }
 
 static const TypeInfo confidential_guest_info = {
@@ -2387,15 +2415,21 @@ static void virt_strip_dtb_for_gunyah(void *fdt, uint32_t gic_phandle)
      */
     static const char * const nodes_to_remove[] = {
         /* Keep /platform-bus@c000000 — uefi-vars-sysbus lives here */
-        "/fw-cfg@9020000",
+        /* Keep /fw-cfg@9020000 — needed by EDK2 for ramfb (GOP),
+         * SMBIOS tables, and ACPI tables.  The device is at 0x09020000
+         * (below 1GiB) so guest accesses trigger MMIO exits which
+         * QEMU dispatches to the fw_cfg handler. */
         "/gpio-keys",
         "/pl061@9030000",
         "/pcie@10000000",
         "/pl031@9010000",
-        /* Keep /pl011@9000000 — QEMU emulates PL011 UART via MMIO exits
-         * so the guest can use it for serial console output.
-         * Keep /apb-pclk — PL011 references this clock via its 'clocks'
-         * property; stripping it causes -EPROBE_DEFER in the driver. */
+        /* Strip original PL011 and apb-pclk — the Gunyah fixup code
+         * recreates them with consistent phandles (phandle=3 for clock).
+         * Keeping the originals causes duplicate nodes; fdt_add_subnode
+         * for the new ones fails silently, and the RM may reassign the
+         * original phandles, breaking clock references → deferred probe. */
+        "/pl011@9000000",
+        "/apb-pclk",
         "/flash@0",
         "/aliases",
         NULL
@@ -2614,6 +2648,7 @@ static void virt_modify_dtb(const struct arm_boot_info *binfo, void *fdt)
 
     /* Root properties */
     fdt_setprop_string(fdt, 0, "compatible", "linux,dummy-virt");
+    fdt_setprop_string(fdt, 0, "model", "QEMU Gunyah Virtual Machine");
     fdt_setprop_cell(fdt, 0, "interrupt-parent", 1);
     fdt_setprop_cell(fdt, 0, "#address-cells", 2);
     fdt_setprop_cell(fdt, 0, "#size-cells", 2);
@@ -2644,7 +2679,15 @@ static void virt_modify_dtb(const struct arm_boot_info *binfo, void *fdt)
             snprintf(bootargs, sizeof(bootargs), "%s", earlycon_args);
         }
         fdt_setprop_string(fdt, chosen_off, "bootargs", bootargs);
+        fdt_setprop_string(fdt, chosen_off, "stdout-path",
+                           "/pl011@9000000");
         error_report("GH: DTB /chosen/bootargs: %s", bootargs);
+        error_report("GH: DTB /chosen/stdout-path: /pl011@9000000");
+    }
+
+    {
+        int aliases_off = fdt_add_subnode(fdt, 0, "aliases");
+        fdt_setprop_string(fdt, aliases_off, "serial0", "/pl011@9000000");
     }
 
     /*
@@ -2743,8 +2786,8 @@ static void virt_modify_dtb(const struct arm_boot_info *binfo, void *fdt)
          * from the DTB to configure the VGIC.
          *
          * Previously used CrosVM addresses (0x3FFF0000 / 0x3FFD0000)
-         * but those overlap with PCI ECAM at 0x3f000000-0x3fffffff,
-         * causing "can't claim ECAM area: address conflict with GICR".
+         * which overlapped with old PCI ECAM at 0x3f000000-0x3fffffff.
+         * Now using CrosVM-compatible PCI layout (ECAM at 0x10000).
          */
         gic_reg[0] = cpu_to_fdt64(0x08000000);  /* DIST base */
         gic_reg[1] = cpu_to_fdt64(0x10000);     /* DIST size */
@@ -2865,24 +2908,31 @@ static void virt_modify_dtb(const struct arm_boot_info *binfo, void *fdt)
      * The kernel discovers PCI via this DTB node and enumerates devices.
      *
      * Addresses (all below 1GiB, trapped by Gunyah):
-     *   ECAM: 0x3f000000 (16MB — PCI config space)
-     *   MMIO: 0x10000000 (783MB — PCI MMIO window)
-     *   PIO:  0x3eff0000 (64KB — PCI I/O ports)
+     *   ECAM, MMIO, PIO — from base_memmap[VIRT_PCIE_*]
      * IRQs: SPIs 3-6 (PCI INTx A-D), matching virt irqmap[VIRT_PCIE]=3
      */
     {
         int pci_off;
-        uint64_t base_ecam = 0x3f000000;
-        uint64_t size_ecam = 0x01000000;
-        uint64_t base_mmio_pci = 0x10000000;
-        uint64_t size_mmio_pci = 0x2eff0000;
-        uint64_t base_pio = 0x3eff0000;
-        uint64_t size_pio = 0x00010000;
+        uint64_t base_ecam = vms->memmap[VIRT_PCIE_ECAM].base;
+        uint64_t size_ecam = vms->memmap[VIRT_PCIE_ECAM].size;
+        uint64_t base_mmio_pci = vms->memmap[VIRT_PCIE_MMIO].base;
+        uint64_t size_mmio_pci = vms->memmap[VIRT_PCIE_MMIO].size;
+        uint64_t base_pio = vms->memmap[VIRT_PCIE_PIO].base;
+        uint64_t size_pio = vms->memmap[VIRT_PCIE_PIO].size;
         int first_irq = 3;
-        int nr_pcie_buses = size_ecam / (1 << 20); /* 16 buses */
+        /*
+         * Limit to 1 PCI bus under Gunyah.  With 16 buses, Windows
+         * cdboot.efi scans all 4096 slots via ECAM MMIO traps, which
+         * is extremely slow under Gunyah's trap-and-emulate path.
+         * CrosVM uses EndBus=0 (1 bus).  We only have devices on bus 0.
+         */
+        int nr_pcie_buses = 1;
         GUNYAHState *gs_pci = get_gunyah_state();
+        char pci_node_name[32];
+        snprintf(pci_node_name, sizeof(pci_node_name),
+                 "pcie@%"PRIx64, base_mmio_pci);
 
-        pci_off = fdt_add_subnode(fdt, 0, "pcie@10000000");
+        pci_off = fdt_add_subnode(fdt, 0, pci_node_name);
         fdt_setprop_string(fdt, pci_off, "compatible",
                            "pci-host-ecam-generic");
         fdt_setprop_string(fdt, pci_off, "device_type", "pci");
@@ -3024,7 +3074,155 @@ static void virt_modify_dtb(const struct arm_boot_info *binfo, void *fdt)
         fdt_setprop(fdt, uart_off, "clocks", uart_clocks, sizeof(uart_clocks));
         fdt_setprop(fdt, uart_off, "clock-names",
                     clocknames, sizeof(clocknames));
-        error_report("GH: DTB /pl011@9000000: ttyAMA0, SPI 1, level-high");
+        /*
+         * clock-frequency on the PL011 node itself — EDK2's FDT serial port
+         * parser reads this directly (not from the clock provider phandle).
+         * Without it, Clock=0 in the Configuration Manager, causing
+         * PL011UartInitializePort to fail with INVALID_PARAMETER in the
+         * DBG2 ACPI table generator.
+         */
+        fdt_setprop_cell(fdt, uart_off, "clock-frequency", 24000000);
+        fdt_setprop(fdt, uart_off, "dma-coherent", NULL, 0);
+        /* Link to restricted-dma-pool so DMA configure succeeds.
+         * PL011 doesn't use DMA, but without this the kernel's
+         * of_dma_configure_id() defers probe when the IOMMU subsystem
+         * is in Translated mode (triggered by restricted-dma-pool). */
+        {
+            GUNYAHState *gs_uart = get_gunyah_state();
+            if (gs_uart && gs_uart->protected_vm && gs_uart->swiotlb_size) {
+                fdt_setprop_cell(fdt, uart_off, "memory-region", 2);
+            }
+        }
+        error_report("GH: DTB /pl011@9000000: ttyAMA0, SPI 1, level-high, 24MHz");
+    }
+
+    /*
+     * /fw-cfg@9020000 — QEMU firmware config device.
+     * EDK2 uses fw_cfg for ramfb (GOP framebuffer), SMBIOS tables,
+     * and ACPI tables.  The device is at 0x09020000 (below 1GiB),
+     * so guest accesses trigger Gunyah MMIO exits dispatched to
+     * QEMU's fw_cfg handler.  Without this node, QemuFwCfgLib
+     * cannot discover the device and QemuRamfbDxe fails.
+     */
+    {
+        int fwcfg_off = fdt_add_subnode(fdt, 0, "fw-cfg@9020000");
+        /*
+         * reg size 0x10 covers only ctl (0x00) + data (0x08) registers.
+         * Excludes the DMA register at offset 0x10 — fw_cfg DMA requires
+         * QEMU to directly access guest RAM, which is LEND'd (host-
+         * inaccessible) under Gunyah, causing SIGBUS.  MMIO-only mode
+         * reads data byte-by-byte via MMIO exits (no guest RAM access).
+         */
+        fdt64_t fwcfg_reg[2] = {
+            cpu_to_fdt64(0x09020000), cpu_to_fdt64(0x10)
+        };
+        fdt_setprop_string(fdt, fwcfg_off, "compatible", "qemu,fw-cfg-mmio");
+        fdt_setprop(fdt, fwcfg_off, "reg", fwcfg_reg, sizeof(fwcfg_reg));
+        fdt_setprop(fdt, fwcfg_off, "dma-coherent", NULL, 0);
+        error_report("GH: DTB /fw-cfg@9020000: fw_cfg MMIO at 0x09020000"
+                     " (no DMA — MMIO-only for Gunyah safety)");
+    }
+
+    /*
+     * Simple-framebuffer for Gunyah VMs — DISABLED.
+     *
+     * The framebuffer address (start of SWIOTLB pool, e.g. 0x178000000)
+     * falls inside the guest RAM range.  The kernel refuses to ioremap
+     * RAM addresses (ioremap_prot fails).  And the restricted-dma-pool
+     * already claims that memory region, conflicting with no-map.
+     *
+     * Proper fix requires either:
+     *   (a) A separate SHARE'd memory slot outside the RAM range
+     *   (b) Guest kernel DMA sync for host-readable framebuffer
+     *
+     * For now, use virtio-gpu-pci (-device virtio-gpu-pci) for display.
+     * VNC shows black screen due to LEND'd memory (known limitation).
+     */
+    {
+        GUNYAHState *gs_sfb = get_gunyah_state();
+        if (gs_sfb->protected_vm && 0 /* disabled: ioremap conflict */) {
+            uint32_t sfb_width = 1280, sfb_height = 720;
+            uint32_t sfb_stride = sfb_width * 4;
+            uint64_t sfb_size = (uint64_t)sfb_stride * sfb_height;
+            uint64_t sfb_addr;
+
+            /* Align to 2MB */
+            sfb_size = (sfb_size + 0x1fffff) & ~0x1fffffULL;
+
+            if (gs_sfb->swiotlb_size > 0) {
+                /* Place at start of SWIOTLB pool */
+                sfb_addr = mem_base + mem_size - gs_sfb->swiotlb_size;
+            } else {
+                /* Fallback: end of RAM minus 4MB */
+                sfb_addr = mem_base + mem_size - sfb_size;
+            }
+
+            /* Start the simplefb display backend */
+            {
+                extern void simplefb_start(uint64_t, uint32_t, uint32_t);
+                simplefb_start(sfb_addr, sfb_width, sfb_height);
+            }
+
+            /*
+             * Add /reserved-memory node to exclude the framebuffer from
+             * the kernel's normal RAM pool.  Without this, ioremap_wc()
+             * in the simpledrm driver fails because the address is in
+             * the linear map.
+             *
+             * The "no-map" property tells the kernel to completely
+             * remove this region from its memory management, allowing
+             * the simpledrm driver to ioremap it.
+             */
+            {
+                int rsvd_off, rsvd_fb_off;
+                fdt64_t rsvd_reg[2];
+                char rsvd_name[64];
+
+                rsvd_off = fdt_add_subnode(fdt, 0, "reserved-memory");
+                fdt_setprop_cell(fdt, rsvd_off, "#address-cells", 2);
+                fdt_setprop_cell(fdt, rsvd_off, "#size-cells", 2);
+                fdt_setprop(fdt, rsvd_off, "ranges", NULL, 0);
+
+                snprintf(rsvd_name, sizeof(rsvd_name),
+                         "framebuffer@%"PRIx64, sfb_addr);
+                rsvd_fb_off = fdt_add_subnode(fdt, rsvd_off, rsvd_name);
+                rsvd_reg[0] = cpu_to_fdt64(sfb_addr);
+                rsvd_reg[1] = cpu_to_fdt64(sfb_size);
+                fdt_setprop(fdt, rsvd_fb_off, "reg",
+                            rsvd_reg, sizeof(rsvd_reg));
+                fdt_setprop(fdt, rsvd_fb_off, "no-map", NULL, 0);
+
+                error_report("GH: DTB /reserved-memory/framebuffer: "
+                             "0x%"PRIx64" size=0x%"PRIx64" (no-map)",
+                             sfb_addr, sfb_size);
+            }
+
+            /* Add DT node for simple-framebuffer */
+            {
+                int sfb_off;
+                char sfb_name[64];
+                fdt64_t sfb_reg[2];
+
+                snprintf(sfb_name, sizeof(sfb_name),
+                         "framebuffer@%"PRIx64, sfb_addr);
+                sfb_off = fdt_add_subnode(fdt, 0, sfb_name);
+                fdt_setprop_string(fdt, sfb_off, "compatible",
+                                   "simple-framebuffer");
+                sfb_reg[0] = cpu_to_fdt64(sfb_addr);
+                sfb_reg[1] = cpu_to_fdt64(sfb_size);
+                fdt_setprop(fdt, sfb_off, "reg", sfb_reg, sizeof(sfb_reg));
+                fdt_setprop_cell(fdt, sfb_off, "width", sfb_width);
+                fdt_setprop_cell(fdt, sfb_off, "height", sfb_height);
+                fdt_setprop_cell(fdt, sfb_off, "stride", sfb_stride);
+                fdt_setprop_string(fdt, sfb_off, "format", "a8r8g8b8");
+                fdt_setprop_string(fdt, sfb_off, "status", "okay");
+
+                error_report("GH: DTB /simplefb@0x%"PRIx64
+                             ": %ux%u stride=%u size=0x%"PRIx64,
+                             sfb_addr, sfb_width, sfb_height,
+                             sfb_stride, sfb_size);
+            }
+        }
     }
 
     /*
@@ -3400,6 +3598,32 @@ static void machvirt_init(MachineState *machine)
     create_uart(vms, VIRT_UART0, sysmem, serial_hd(0), false);
     if (vms->secure) {
         create_uart(vms, VIRT_UART1, secure_sysmem, serial_hd(1), true);
+    }
+
+    /*
+     * Under Gunyah, create an NS16550A (serial-mm) device at VIRT_UART1
+     * address for Windows SPCR/DBG2 ACPI table support.
+     * The DTB node for this device is created in gunyah_build_minimal_dtb().
+     */
+    if (gunyah_enabled() && !vms->secure) {
+        DeviceState *ns_dev;
+        SysBusDevice *ns_sbd;
+
+        ns_dev = qdev_new(TYPE_SERIAL_MM);
+        qdev_prop_set_uint8(ns_dev, "regshift", 2);
+        qdev_prop_set_uint32(ns_dev, "baudbase", 115200);
+        qdev_prop_set_uint8(ns_dev, "endianness", DEVICE_LITTLE_ENDIAN);
+        /* Connect to chardev serial1 if available, else null */
+        if (serial_hd(1)) {
+            qdev_prop_set_chr(ns_dev, "chardev", serial_hd(1));
+        }
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(ns_dev), &error_fatal);
+        ns_sbd = SYS_BUS_DEVICE(ns_dev);
+        memory_region_add_subregion(sysmem,
+            vms->memmap[VIRT_UART1].base,
+            sysbus_mmio_get_region(ns_sbd, 0));
+        sysbus_connect_irq(ns_sbd, 0,
+            qdev_get_gpio_in(vms->gic, vms->irqmap[VIRT_UART1]));
     }
 
     if (vms->secure) {
