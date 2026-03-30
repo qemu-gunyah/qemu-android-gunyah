@@ -252,7 +252,34 @@ static void fw_cfg_reboot(FWCfgState *s)
 
 static void fw_cfg_write(FWCfgState *s, uint8_t value)
 {
-    /* nothing, write support removed in QEMU v2.4+ */
+    int arch = !!(s->cur_entry & FW_CFG_ARCH_LOCAL);
+    FWCfgEntry *e;
+    static int fw_write_log = 0;
+
+    if (s->cur_entry == FW_CFG_INVALID) {
+        return;
+    }
+
+    e = &s->entries[arch][s->cur_entry & FW_CFG_ENTRY_MASK];
+    if (e->data && s->cur_offset < e->len) {
+        e->data[s->cur_offset++] = value;
+        if (fw_write_log < 5) {
+            fprintf(stderr, "fw_cfg_write: entry=0x%x offset=%u/%u val=0x%02x\n",
+                    s->cur_entry, s->cur_offset, e->len, value);
+        }
+        if (s->cur_offset == e->len) {
+            fw_write_log++;
+            fprintf(stderr, "fw_cfg_write: COMPLETE entry=0x%x len=%u write_cb=%p\n",
+                    s->cur_entry, e->len, e->write_cb);
+            if (e->write_cb) {
+                e->write_cb(e->callback_opaque, 0, e->len);
+            }
+        }
+    } else if (fw_write_log < 3) {
+        fprintf(stderr, "fw_cfg_write: SKIP entry=0x%x data=%p offset=%u len=%u\n",
+                s->cur_entry, e->data, s->cur_offset, e->len);
+        fw_write_log++;
+    }
 }
 
 static inline uint16_t fw_cfg_file_slots(const FWCfgState *s)

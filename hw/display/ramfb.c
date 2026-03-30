@@ -18,6 +18,7 @@
 #include "hw/display/bochs-vbe.h" /* for limits */
 #include "ui/console.h"
 #include "system/reset.h"
+#include "system/gunyah.h"
 
 struct QEMU_PACKED RAMFBCfg {
     uint64_t addr;
@@ -34,6 +35,12 @@ struct RAMFBState {
     DisplaySurface *ds;
     uint32_t width, height;
     struct RAMFBCfg cfg;
+    /* Gunyah: host-side framebuffer copy for LEND'd memory */
+    void *gh_buf;
+    hwaddr gh_addr;
+    hwaddr gh_size;
+    hwaddr gh_stride;
+    pixman_format_code_t gh_format;
 };
 
 static void ramfb_unmap_display_surface(pixman_image_t *image, void *unused)
@@ -91,8 +98,44 @@ static void ramfb_fw_cfg_write(void *dev, off_t offset, size_t len)
     addr   = be64_to_cpu(s->cfg.addr);
     format = qemu_drm_format_to_pixman(fourcc);
 
-    surface = ramfb_create_display_surface(width, height,
-                                           format, stride, addr);
+    if (gunyah_enabled()) {
+        /* Gunyah: the guest's framebuffer address is in LEND'd memory,
+         * but we set up a simplefb region in SHARE'd memory.
+         * Try to map the simplefb SHARE'd address directly first.
+         * If the guest uses a different address (LEND'd), fall back to
+         * cpu_physical_memory_read polling. */
+        hwaddr linesize = width * PIXMAN_FORMAT_BPP(format) / 8;
+        if (stride == 0) stride = linesize;
+        hwaddr size = stride * (height - 1) + linesize;
+
+        g_free(s->gh_buf);
+        s->gh_buf = g_malloc0(size);
+        s->gh_addr = addr;
+        s->gh_size = size;
+        s->gh_stride = stride;
+        s->gh_format = format;
+
+        /* Try direct map first (works if addr is in SHARE'd region) */
+        hwaddr mapsize = size;
+        void *direct = cpu_physical_memory_map(addr, &mapsize, false);
+        if (direct && mapsize == size) {
+            /* Check if the mapped memory is readable (not all zeros) */
+            surface = qemu_create_displaysurface_from(width, height,
+                                                      format, stride, direct);
+            pixman_image_set_destroy_function(surface->image,
+                                              ramfb_unmap_display_surface, NULL);
+            /* Still keep gh_buf for polling fallback */
+        } else {
+            if (direct) cpu_physical_memory_unmap(direct, mapsize, 0, 0);
+            cpu_physical_memory_read(addr, s->gh_buf, size);
+            surface = qemu_create_displaysurface_from(width, height,
+                                                      format, stride, s->gh_buf);
+        }
+    } else {
+        surface = ramfb_create_display_surface(width, height,
+                                               format, stride, addr);
+    }
+
     if (!surface) {
         return;
     }
@@ -112,6 +155,30 @@ void ramfb_display_update(QemuConsole *con, RAMFBState *s)
     if (s->ds) {
         dpy_gfx_replace_surface(con, s->ds);
         s->ds = NULL;
+    }
+
+    /*
+     * Gunyah: if the console surface was replaced (e.g. by virtio-gpu
+     * reset creating a blank placeholder), recreate the ramfb surface
+     * so display falls back to the ramfb framebuffer.
+     */
+    if (s->gh_buf && s->gh_size > 0 && !s->ds) {
+        DisplaySurface *cur = qemu_console_surface(con);
+        void *cur_data = cur ? surface_data(cur) : NULL;
+        if (cur_data != s->gh_buf) {
+            /* Console surface doesn't point to our buffer — recreate */
+            DisplaySurface *ds = qemu_create_displaysurface_from(
+                s->width, s->height, s->gh_format, s->gh_stride, s->gh_buf);
+            if (ds) {
+                dpy_gfx_replace_surface(con, ds);
+            }
+        }
+    }
+
+    /* Gunyah: re-read framebuffer from guest memory each frame,
+     * since the direct mapping returns zeros for LEND'd pages. */
+    if (s->gh_buf && s->gh_size > 0) {
+        cpu_physical_memory_read(s->gh_addr, s->gh_buf, s->gh_size);
     }
 
     /* simple full screen update */
@@ -140,8 +207,8 @@ RAMFBState *ramfb_setup(Error **errp)
     FWCfgState *fw_cfg = fw_cfg_find();
     RAMFBState *s;
 
-    if (!fw_cfg || !fw_cfg->dma_enabled) {
-        error_setg(errp, "ramfb device requires fw_cfg with DMA");
+    if (!fw_cfg) {
+        error_setg(errp, "ramfb device requires fw_cfg");
         return NULL;
     }
 

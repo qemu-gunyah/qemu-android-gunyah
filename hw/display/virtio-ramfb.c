@@ -6,6 +6,8 @@
 #include "virtio-ramfb.h"
 #include "qapi/error.h"
 #include "qom/object.h"
+#include "system/gunyah.h"
+#include "qemu/iov.h"
 
 static int virtio_ramfb_get_flags(void *opaque)
 {
@@ -46,6 +48,28 @@ static void virtio_ramfb_update_display(void *opaque)
 
     if (g->enable) {
         g->hw_ops->gfx_update(g);
+
+        /* Gunyah fix: When virtio-gpu is enabled but no FLUSH commands
+         * arrive (e.g. GRUB using EFI GOP without a virtio-gpu driver),
+         * periodically refresh the scanout from the resource's IOV backing.
+         * The IOV points to SHARE'd memory (readable by the host). */
+        if (gunyah_enabled()) {
+            VirtIOGPU *gpu = VIRTIO_GPU(g);
+            struct virtio_gpu_scanout *scanout = &g->scanout[0];
+            if (scanout->resource_id) {
+                struct virtio_gpu_simple_resource *res;
+                res = virtio_gpu_find_resource(gpu, scanout->resource_id);
+                if (res && res->iov && res->iov_cnt && res->image) {
+                    /* Copy from IOV (SHARE'd bounce buffer) to pixman image */
+                    void *img_data = pixman_image_get_data(res->image);
+                    uint32_t stride = pixman_image_get_stride(res->image);
+                    uint32_t h = pixman_image_get_height(res->image);
+                    iov_to_buf(res->iov, res->iov_cnt, 0,
+                               img_data, stride * h);
+                    dpy_gfx_update_full(scanout->con);
+                }
+            }
+        }
     } else {
         ramfb_display_update(g->scanout[0].con, vramfb->ramfb);
     }

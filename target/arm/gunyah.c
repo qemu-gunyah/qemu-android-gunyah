@@ -177,6 +177,9 @@ void gunyah_arm_fdt_customize(void *fdt, uint64_t mem_base,
         g_free(nodename);
     }
 
+    /* SimpleFB DTB node is created by the simplefb device itself,
+     * not here — avoids FDT_ERR_EXISTS conflict. */
+
     /*
      * Doorbell vdevice nodes.
      * Base doorbells matching CrosVM:
@@ -258,6 +261,33 @@ void gunyah_arm_fdt_customize(void *fdt, uint64_t mem_base,
             g_free(nodename);
         }
     }
+}
+
+/*
+ * SimpleFB: carve 8MB from the end of the SHARE'd (SWIOTLB) region for a
+ * framebuffer.  This gives the guest a physical address that the host can
+ * also read, solving the LEND'd-memory display problem.
+ *
+ * Memory layout (end of guest RAM):
+ *   ... LEND'd main RAM ...
+ *   [simplefb 8MB] [SWIOTLB remaining] ← both SHARE'd
+ *
+ * The simplefb address = mem_base + ram_size - swiotlb_size
+ * (first 8MB of the SHARE'd region)
+ */
+#define GUNYAH_SIMPLEFB_SIZE  (8 * 1024 * 1024)  /* 8MB, enough for 1920x1080x4 */
+
+uint64_t gunyah_get_simplefb_addr(void)
+{
+    MachineState *ms = MACHINE(qdev_get_machine());
+    GUNYAHState *s = get_gunyah_state();
+    uint64_t mem_base = 0x80000000;  /* AARCH64_PHYS_MEM_START */
+    return mem_base + ms->ram_size - s->swiotlb_size;
+}
+
+uint64_t gunyah_get_simplefb_size(void)
+{
+    return GUNYAH_SIMPLEFB_SIZE;
 }
 
 int gunyah_arch_put_registers(CPUState *cs, int level)
