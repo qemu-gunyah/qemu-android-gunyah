@@ -33,6 +33,11 @@ struct rutabaga_aio_data {
     struct rutabaga_fence fence;
 };
 
+static void rutabaga_unref_resource(pixman_image_t *image, void *data)
+{
+    pixman_image_unref(data);
+}
+
 static void
 virtio_gpu_rutabaga_update_cursor(VirtIOGPU *g, struct virtio_gpu_scanout *s,
                                   uint32_t resource_id)
@@ -354,10 +359,42 @@ rutabaga_cmd_set_scanout(VirtIOGPU *g, struct virtio_gpu_ctrl_command *cmd)
 
     vb->enable = 1;
 
-    /* realloc the surface ptr */
-    scanout->ds = qemu_create_displaysurface_pixman(res->image);
+    /*
+     * Use the scanout rectangle (ss.r) to create the display surface.
+     * The guest may allocate a resource larger than the display (e.g. due
+     * to GPU stride alignment) and set scanout to the visible sub-rect.
+     * Without this, resolutions like 1360x768 show black padding edges.
+     */
+    if (ss.r.width && ss.r.height &&
+        ss.r.x + ss.r.width <= res->width &&
+        ss.r.y + ss.r.height <= res->height) {
+        int stride = pixman_image_get_stride(res->image);
+        int bpp = PIXMAN_FORMAT_BPP(pixman_image_get_format(res->image)) / 8;
+        uint8_t *data = (uint8_t *)pixman_image_get_data(res->image);
+        uint8_t *ptr = data + ss.r.y * stride + ss.r.x * bpp;
+        pixman_image_t *rect;
+
+        rect = pixman_image_create_bits(pixman_image_get_format(res->image),
+                                        ss.r.width, ss.r.height,
+                                        (uint32_t *)ptr, stride);
+        CHECK(rect, cmd);
+
+        /* Keep a reference to the underlying resource image */
+        pixman_image_ref(res->image);
+        pixman_image_set_destroy_function(rect, rutabaga_unref_resource,
+                                          res->image);
+
+        scanout->ds = qemu_create_displaysurface_pixman(rect);
+        pixman_image_unref(rect);
+    } else {
+        /* Fallback: use full resource image */
+        scanout->ds = qemu_create_displaysurface_pixman(res->image);
+    }
+
     dpy_gfx_replace_surface(scanout->con, NULL);
     dpy_gfx_replace_surface(scanout->con, scanout->ds);
+    scanout->width = ss.r.width;
+    scanout->height = ss.r.height;
     res->scanout_bitmask = ss.scanout_id;
 }
 
