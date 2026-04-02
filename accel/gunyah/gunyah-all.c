@@ -505,12 +505,21 @@ static void gunyah_add_mem_slot(GUNYAHState *s,
     }
 
     if (ret) {
-        error_report("GH: %s ioctl FAILED: %s (ret=%d, errno=%d)",
-                     lend ? "LEND" : "SHARE", strerror(errno), ret, errno);
-        exit(1);
+        if (!lend && errno == EEXIST) {
+            /* SHARE of an already-SHARE'd GPA.  Gunyah SHARE is permanent.
+             * gfxstream recycles pinned RingBlob memory so the new HVA
+             * should have the same physical pages as the original SHARE. */
+            error_report("GH: SHARE gpa=0x%"PRIx64" already exists — reusing"
+                         " (recycled RingBlob)", gpa);
+        } else {
+            error_report("GH: %s ioctl FAILED: %s (ret=%d, errno=%d)",
+                         lend ? "LEND" : "SHARE", strerror(errno), ret, errno);
+            exit(1);
+        }
+    } else {
+        error_report("GH: add_mem_slot OK (gpa=0x%"PRIx64" size=0x%"PRIx64")",
+                     gpa, size);
     }
-    error_report("GH: add_mem_slot OK (gpa=0x%"PRIx64" size=0x%"PRIx64")",
-                 gpa, size);
 }
 
 static void gunyah_add_mem(GUNYAHState *s, MemoryRegionSection *section,
@@ -1164,6 +1173,25 @@ static void gunyah_set_phys_mem(GUNYAHState *s,
                  add, memory_region_is_ram(area), writable, lend);
 
     /*
+     * Detect virtio-gpu hostmem BAR and its sub-regions (blob resources).
+     * These must be SHARE'd (not LEND'd) because both guest and host need
+     * read/write access.  No execute permission needed (data only).
+     *
+     * Match either:
+     *  - The full BAR: name="virtio-gpu-hostmem" (memfd-backed RAM)
+     *  - Dynamic sub-regions: name="blob" inside parent "virtio-gpu-hostmem"
+     */
+    bool is_hostmem_blob = false;
+    if (memory_region_is_ram(area) && area->name &&
+        strcmp(area->name, "blob") == 0) {
+        MemoryRegion *parent = area->container;
+        if (parent && parent->name &&
+            strcmp(parent->name, "virtio-gpu-hostmem") == 0) {
+            is_hostmem_blob = true;
+        }
+    }
+
+    /*
      * Gunyah hypervisor, at this time, does not support mapping memory
      * at low address (< 1GiB). Below code will be updated once
      * that limitation is addressed.
@@ -1172,8 +1200,11 @@ static void gunyah_set_phys_mem(GUNYAHState *s,
      * can execute firmware directly from shared memory.  Without this,
      * instruction fetches from unmapped addresses cause stage-2 aborts
      * (not MMIO exits) and the firmware crashes immediately.
+     *
+     * Exception 2: virtio-gpu hostmem blob regions are allowed through
+     * even at low GPA — they are SHARE'd for gfxstream ASG transport.
      */
-    if (section->offset_within_address_space < GiB) {
+    if (section->offset_within_address_space < GiB && !is_hostmem_blob) {
         /* Gunyah MMIO window covers <1GiB — don't register these regions.
          * Log only once per address to avoid flooding (pflash toggles
          * ROMD/MMIO mode rapidly, which would OOM via GLib allocations). */
@@ -1215,6 +1246,19 @@ static void gunyah_set_phys_mem(GUNYAHState *s,
 
     if (!add) {
         if (slot) {
+            if (is_hostmem_blob) {
+                /* Free the slot so it can be reused by a new blob at
+                 * the same GPA.  The Gunyah SHARE persists permanently
+                 * but gfxstream is patched to reuse the same RingBlob
+                 * memory, so the re-SHARE'd HVA has the same physical
+                 * pages as the original SHARE. */
+                error_report("GH: hostmem blob removal at gpa=0x%"PRIx64
+                             " size=0x%"PRIx64" — freeing slot",
+                             (uint64_t)section->offset_within_address_space,
+                             (uint64_t)int128_get64(section->size));
+                slot->size = 0;
+                goto done;
+            }
             error_report("Memory slot removal not yet supported!");
             exit(1);
         }
@@ -1222,17 +1266,38 @@ static void gunyah_set_phys_mem(GUNYAHState *s,
         goto done;
     } else {
         if (slot) {
-            error_report("Overlapping slot registration not supported!");
-            exit(1);
+            if (is_hostmem_blob) {
+                /* Reuse: free old slot first, then fall through to add new one */
+                error_report("GH: hostmem blob reuse at gpa=0x%"PRIx64
+                             " — freeing old slot",
+                             (uint64_t)section->offset_within_address_space);
+                slot->size = 0;
+                slot = NULL;
+            } else {
+                error_report("Overlapping slot registration not supported!");
+                exit(1);
+            }
         }
 
-        if (qatomic_read(&s->vm_started)) {
+        if (qatomic_read(&s->vm_started) && !is_hostmem_blob) {
             error_report("Memory map changes after VM start not supported!");
             exit(1);
         }
     }
 
-    if (area->readonly || area->rom_device ||
+    /*
+     * hostmem blob regions: SHARE with READ|WRITE only (no EXEC).
+     * These are gfxstream ASG ring buffers / shared data — both guest
+     * and host need access, but no code execution from this memory.
+     */
+    if (is_hostmem_blob) {
+        lend = false;  /* SHARE, not LEND */
+        flags = GH_MEM_ALLOW_READ | GH_MEM_ALLOW_WRITE;
+        error_report("GH: hostmem blob region at gpa=0x%"PRIx64
+                     " size=0x%"PRIx64" — using SHARE (no exec)",
+                     (uint64_t)section->offset_within_address_space,
+                     (uint64_t)int128_get64(section->size));
+    } else if (area->readonly || area->rom_device ||
         (!memory_region_is_ram(area) && memory_region_is_romd(area))) {
         /*
          * For ROM/readonly regions, we ideally want READ|EXEC only so

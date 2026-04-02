@@ -707,6 +707,8 @@ bool qemu_wakeup_suspend_enabled(void)
 
 void qemu_system_killed(int signal, pid_t pid)
 {
+    static int kill_count = 0;
+
     shutdown_signal = signal;
     shutdown_pid = pid;
     shutdown_action = SHUTDOWN_ACTION_POWEROFF;
@@ -716,6 +718,15 @@ void qemu_system_killed(int signal, pid_t pid)
      */
     shutdown_requested = SHUTDOWN_CAUSE_HOST_SIGNAL;
     qemu_notify_event();
+
+    /*
+     * Gunyah workaround: vCPU threads may be stuck in GH_VCPU_RUN
+     * and won't exit cleanly.  Force-exit on second signal.
+     */
+    kill_count++;
+    if (kill_count >= 2) {
+        _exit(0);
+    }
 }
 
 void qemu_system_shutdown_request_with_code(ShutdownCause reason,

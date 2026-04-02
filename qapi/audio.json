@@ -482,7 +482,8 @@
             { 'name': 'sdl', 'if': 'CONFIG_AUDIO_SDL' },
             { 'name': 'sndio', 'if': 'CONFIG_AUDIO_SNDIO' },
             { 'name': 'spice', 'if': 'CONFIG_SPICE' },
-            'wav' ] }
+            'wav',
+            { 'name': 'aaudio', 'if': 'CONFIG_AUDIO_AAUDIO' } ] }
 
 ##
 # @Audiodev:
@@ -528,7 +529,9 @@
                    'if': 'CONFIG_AUDIO_SNDIO' },
     'spice':     { 'type': 'AudiodevGenericOptions',
                    'if': 'CONFIG_SPICE' },
-    'wav':       'AudiodevWavOptions' } }
+    'wav':       'AudiodevWavOptions',
+    'aaudio':    { 'type': 'AudiodevGenericOptions',
+                   'if': 'CONFIG_AUDIO_AAUDIO' } } }
 
 ##
 # @query-audiodevs:

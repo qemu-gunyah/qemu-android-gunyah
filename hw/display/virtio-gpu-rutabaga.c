@@ -1,5 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
+#ifndef MREMAP_DONTUNMAP
+#define MREMAP_DONTUNMAP 4
+#endif
+
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
@@ -11,6 +15,7 @@
 #include "hw/virtio/virtio-iommu.h"
 
 #include <glib/gmem.h>
+#include <sys/mman.h>
 #include <rutabaga_gfx/rutabaga_gfx_ffi.h>
 
 #define CHECK(condition, cmd)                                                 \
@@ -155,6 +160,25 @@ virtio_gpu_rutabaga_resource_unref(VirtIOGPU *g,
     int32_t result;
     VirtIOGPURutabaga *vr = VIRTIO_GPU_RUTABAGA(g);
 
+    /*
+     * Gunyah workaround: for hostmem-mapped blob resources, skip the
+     * rutabaga_resource_unref call (which would free gfxstream's internal
+     * memory backing the SHARE'd pages).  But still remove the resource
+     * from QEMU's reslist so resource IDs can be reused normally.
+     * The gfxstream-side memory is kept alive by sPinnedRingBlobs.
+     */
+    for (uint32_t i = 0; i < MAX_SLOTS; i++) {
+        if (vr->memory_regions[i].used &&
+            vr->memory_regions[i].resource_id == res->resource_id) {
+            error_report("GH: RESOURCE_UNREF resource_id=%u"
+                         " — skip rutabaga unref (SHARE'd), free QEMU resource",
+                         res->resource_id);
+            /* Don't call rutabaga_resource_unref — gfxstream memory stays.
+             * But DO clean up the QEMU-side resource below. */
+            goto cleanup;
+        }
+    }
+
     result = rutabaga_resource_unref(vr->rutabaga, res->resource_id);
     if (result) {
         error_setg_errno(errp,
@@ -164,6 +188,7 @@ virtio_gpu_rutabaga_resource_unref(VirtIOGPU *g,
                         res->resource_id);
     }
 
+cleanup:
     if (res->image) {
         pixman_image_unref(res->image);
     }
@@ -715,12 +740,9 @@ static void
 rutabaga_cmd_resource_unmap_blob(VirtIOGPU *g,
                                  struct virtio_gpu_ctrl_command *cmd)
 {
-    int32_t result;
-    uint32_t slot = 0;
     struct virtio_gpu_simple_resource *res;
     struct virtio_gpu_resource_unmap_blob ublob;
 
-    VirtIOGPUBase *vb = VIRTIO_GPU_BASE(g);
     VirtIOGPURutabaga *vr = VIRTIO_GPU_RUTABAGA(g);
 
     VIRTIO_GPU_FILL_CMD(ublob);
@@ -730,22 +752,26 @@ rutabaga_cmd_resource_unmap_blob(VirtIOGPU *g,
     res = virtio_gpu_find_resource(g, ublob.resource_id);
     CHECK(res, cmd);
 
-    for (slot = 0; slot < MAX_SLOTS; slot++) {
-        if (vr->memory_regions[slot].resource_id != ublob.resource_id) {
-            continue;
-        }
-
-        MemoryRegion *mr = &(vr->memory_regions[slot].mr);
-        memory_region_del_subregion(&vb->hostmem, mr);
-
-        vr->memory_regions[slot].resource_id = 0;
-        vr->memory_regions[slot].used = 0;
-        break;
-    }
-
-    CHECK(slot < MAX_SLOTS, cmd);
-    result = rutabaga_resource_unmap(vr->rutabaga, res->resource_id);
-    CHECK(!result, cmd);
+    /*
+     * Gunyah workaround: DON'T actually unmap blob resources.
+     *
+     * On Gunyah, the hostmem BAR sub-regions are SHARE'd with the guest.
+     * Once SHARE'd, the mapping is permanent — we can't re-SHARE different
+     * pages at the same GPA later. If we unmap now and a new blob is created
+     * at the same BAR offset, the new blob's pages won't match the SHARE'd
+     * pages, causing the guest to read stale data.
+     *
+     * By keeping blobs alive, each new blob gets a fresh BAR offset.
+     * The 256MB hostmem BAR has room for many ~1MB ASG ring buffers.
+     *
+     * The guest kernel still processes the UNMAP response normally,
+     * unmapping the blob from userspace and freeing the GPA range for reuse
+     * (but the host-side memory and SHARE persist).
+     */
+    error_report("GH: UNMAP_BLOB resource_id=%u — keeping alive (Gunyah SHARE)",
+                 ublob.resource_id);
+    /* Don't remove sub-region, don't unmap resource, don't free slot.
+     * The slot stays "used" so it won't be reused. */
 }
 
 static void

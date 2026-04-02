@@ -35,8 +35,10 @@ static void virtio_gpu_pci_base_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
     if (virtio_gpu_hostmem_enabled(g->conf)) {
         vpci_dev->msix_bar_idx = 1;
         vpci_dev->modern_mem_bar_idx = 2;
+
         memory_region_init(&g->hostmem, OBJECT(g), "virtio-gpu-hostmem",
                            g->conf.hostmem);
+
         pci_register_bar(&vpci_dev->pci_dev, 4,
                          PCI_BASE_ADDRESS_SPACE_MEMORY |
                          PCI_BASE_ADDRESS_MEM_PREFETCH |
